@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{collections::BTreeSet, env, net::SocketAddr};
 
 use axum::{
     extract::{Path, State},
@@ -85,6 +85,53 @@ struct RejectProposalResponse {
     proposal_id: String,
     status: String,
     resolved_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgetMemoryRequest {
+    canonical_key: String,
+    #[serde(default = "default_true")]
+    forget_evidence: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ForgetMemoryResponse {
+    canonical_key: String,
+    deleted_memory_item_id: String,
+    deleted_versions: usize,
+    deleted_links: usize,
+    deleted_evidence: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryViewResponse {
+    memory_item_id: String,
+    canonical_key: String,
+    memory_type: String,
+    active_version_id: String,
+    value_json: Value,
+    evidence_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryHistoryResponse {
+    memory_item_id: String,
+    canonical_key: String,
+    memory_type: String,
+    versions: Vec<MemoryVersionHistoryEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryVersionHistoryEntry {
+    version_id: String,
+    version_number: i64,
+    state: String,
+    value_json: Value,
+    supersedes_version_id: Option<String>,
+    valid_from: String,
+    valid_to: Option<String>,
+    created_at: String,
+    evidence_record_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +221,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/proposals", post(create_proposal))
         .route("/v1/proposals/{id}/commit", post(commit_proposal))
         .route("/v1/proposals/{id}/reject", post(reject_proposal))
+        .route("/v1/memory/{canonical_key}", get(get_memory))
+        .route("/v1/memory/{canonical_key}/history", get(get_memory_history))
+        .route("/v1/memory/forget", post(forget_memory))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -383,6 +433,226 @@ async fn reject_proposal(
     }))
 }
 
+async fn get_memory(
+    State(state): State<AppState>,
+    Path(canonical_key): Path<String>,
+) -> Result<Json<MemoryViewResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+
+    let row: Option<(String, String, String, String, String)> = conn
+        .query_row(
+            "
+            SELECT mi.id, mi.canonical_key, mi.memory_type, mv.id, mv.value_json
+            FROM memory_items mi
+            JOIN memory_item_versions mv ON mv.id = mi.active_version_id
+            WHERE mi.canonical_key = ?1
+            LIMIT 1
+            ",
+            params![&canonical_key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup memory item: {}", e)))?;
+
+    let (memory_item_id, canonical_key, memory_type, active_version_id, raw_value) =
+        row.ok_or_else(|| ApiError::not_found("memory item not found"))?;
+
+    let value_json: Value = serde_json::from_str(&raw_value)
+        .map_err(|e| ApiError::internal(format!("failed to decode value_json: {}", e)))?;
+
+    let evidence_record_ids = load_evidence_for_version(&conn, &active_version_id)?;
+
+    Ok(Json(MemoryViewResponse {
+        memory_item_id,
+        canonical_key,
+        memory_type,
+        active_version_id,
+        value_json,
+        evidence_record_ids,
+    }))
+}
+
+async fn get_memory_history(
+    State(state): State<AppState>,
+    Path(canonical_key): Path<String>,
+) -> Result<Json<MemoryHistoryResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+
+    let item_row: Option<(String, String)> = conn
+        .query_row(
+            "
+            SELECT id, memory_type
+            FROM memory_items
+            WHERE canonical_key = ?1
+            LIMIT 1
+            ",
+            params![&canonical_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup memory item: {}", e)))?;
+
+    let (memory_item_id, memory_type) =
+        item_row.ok_or_else(|| ApiError::not_found("memory item not found"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, version_number, state, value_json, supersedes_version_id, valid_from, valid_to, created_at
+            FROM memory_item_versions
+            WHERE memory_item_id = ?1
+            ORDER BY version_number DESC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare history query: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![&memory_item_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute history query: {}", e)))?;
+
+    let mut versions = Vec::new();
+    for row in rows {
+        let (
+            version_id,
+            version_number,
+            state,
+            raw_value,
+            supersedes_version_id,
+            valid_from,
+            valid_to,
+            created_at,
+        ) = row.map_err(|e| ApiError::internal(format!("failed to read history row: {}", e)))?;
+
+        let value_json: Value = serde_json::from_str(&raw_value)
+            .map_err(|e| ApiError::internal(format!("failed to decode value_json: {}", e)))?;
+        let evidence_record_ids = load_evidence_for_version(&conn, &version_id)?;
+
+        versions.push(MemoryVersionHistoryEntry {
+            version_id,
+            version_number,
+            state,
+            value_json,
+            supersedes_version_id,
+            valid_from,
+            valid_to,
+            created_at,
+            evidence_record_ids,
+        });
+    }
+
+    Ok(Json(MemoryHistoryResponse {
+        memory_item_id,
+        canonical_key,
+        memory_type,
+        versions,
+    }))
+}
+
+async fn forget_memory(
+    State(state): State<AppState>,
+    Json(payload): Json<ForgetMemoryRequest>,
+) -> Result<Json<ForgetMemoryResponse>, ApiError> {
+    if payload.canonical_key.trim().is_empty() {
+        return Err(ApiError::bad_request("canonical_key is required"));
+    }
+
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+    let memory_item_id: Option<String> = tx
+        .query_row(
+            "
+            SELECT id
+            FROM memory_items
+            WHERE canonical_key = ?1
+            LIMIT 1
+            ",
+            params![&payload.canonical_key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup memory item: {}", e)))?;
+
+    let memory_item_id = memory_item_id.ok_or_else(|| ApiError::not_found("memory item not found"))?;
+
+    let version_ids = load_version_ids_for_item(&tx, &memory_item_id)?;
+    let linked_evidence_ids = load_evidence_ids_for_versions(&tx, &version_ids)?;
+
+    let deleted_links = tx
+        .execute(
+            "
+            DELETE FROM memory_links
+            WHERE memory_item_version_id IN (
+              SELECT id FROM memory_item_versions WHERE memory_item_id = ?1
+            )
+            ",
+            params![&memory_item_id],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to delete memory links: {}", e)))?;
+
+    let deleted_versions = tx
+        .execute(
+            "DELETE FROM memory_item_versions WHERE memory_item_id = ?1",
+            params![&memory_item_id],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to delete memory versions: {}", e)))?;
+
+    tx.execute("DELETE FROM memory_items WHERE id = ?1", params![&memory_item_id])
+        .map_err(|e| ApiError::internal(format!("failed to delete memory item: {}", e)))?;
+
+    let mut deleted_evidence = 0usize;
+    if payload.forget_evidence {
+        for evidence_id in linked_evidence_ids {
+            let still_linked: Option<String> = tx
+                .query_row(
+                    "
+                    SELECT evidence_record_id
+                    FROM memory_links
+                    WHERE evidence_record_id = ?1
+                    LIMIT 1
+                    ",
+                    params![&evidence_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| ApiError::internal(format!("failed evidence linkage lookup: {}", e)))?;
+
+            if still_linked.is_none() {
+                deleted_evidence += tx
+                    .execute(
+                        "DELETE FROM evidence_records WHERE id = ?1",
+                        params![&evidence_id],
+                    )
+                    .map_err(|e| ApiError::internal(format!("failed to delete evidence record: {}", e)))?;
+            }
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(ForgetMemoryResponse {
+        canonical_key: payload.canonical_key,
+        deleted_memory_item_id: memory_item_id,
+        deleted_versions,
+        deleted_links,
+        deleted_evidence,
+    }))
+}
+
 fn open_db(db_path: &str) -> Result<Connection, ApiError> {
     let conn = Connection::open(db_path)
         .map_err(|e| ApiError::internal(format!("failed to open db: {}", e)))?;
@@ -484,6 +754,62 @@ fn next_version_number(conn: &Connection, memory_item_id: &str) -> Result<i64, A
         )
         .map_err(|e| ApiError::internal(format!("failed to compute version number: {}", e)))?;
     Ok(version)
+}
+
+fn load_evidence_for_version(conn: &Connection, version_id: &str) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT evidence_record_id
+            FROM memory_links
+            WHERE memory_item_version_id = ?1
+            ORDER BY created_at ASC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare evidence lookup: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![version_id], |r| r.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to execute evidence lookup: {}", e)))?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    collected.map_err(|e| ApiError::internal(format!("failed to read evidence rows: {}", e)))
+}
+
+fn load_version_ids_for_item(conn: &Connection, memory_item_id: &str) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id
+            FROM memory_item_versions
+            WHERE memory_item_id = ?1
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare version lookup: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![memory_item_id], |r| r.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to execute version lookup: {}", e)))?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    collected.map_err(|e| ApiError::internal(format!("failed to read version rows: {}", e)))
+}
+
+fn load_evidence_ids_for_versions(
+    conn: &Connection,
+    version_ids: &[String],
+) -> Result<BTreeSet<String>, ApiError> {
+    let mut evidence_ids = BTreeSet::new();
+    for version_id in version_ids {
+        for evidence_id in load_evidence_for_version(conn, version_id)? {
+            evidence_ids.insert(evidence_id);
+        }
+    }
+    Ok(evidence_ids)
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn ensure_data_dir(db_path: &str) -> anyhow::Result<()> {

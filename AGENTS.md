@@ -81,6 +81,14 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `POST /mcp` with `initialize`, `tools/list`, and `tools/call`
   - tool mapping for `yena.connect`, `yena.retrieve`, `yena.scope.upsert`, `yena.policy.redact_keys`
 - Verified live JSON-RPC integration flow end-to-end across ingest/compiler/mcp services.
+- Extended `memory-compiler` with query/governance endpoints:
+  - `GET /v1/memory/{canonical_key}`
+  - `GET /v1/memory/{canonical_key}/history`
+  - `POST /v1/memory/forget`
+- Verified live memory history and forget behavior:
+  - history returns version timeline with evidence links
+  - forget removes memory item/versions/links
+  - forget removes now-unreferenced linked evidence when `forget_evidence=true`
 
 ## Progress Tracker
 
@@ -92,6 +100,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Evidence ingestion v1 implemented
 - [x] Memory compiler v1 implemented
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
+- [~] Governance primitives implemented (forget command API complete; retention jobs/UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

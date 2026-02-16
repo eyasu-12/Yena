@@ -77,6 +77,75 @@ Response `200`:
 }
 ```
 
+## GET /v1/memory/{canonical_key}
+
+Returns the active memory version and linked evidence IDs.
+
+Response `200`:
+
+```json
+{
+  "memory_item_id": "uuid",
+  "canonical_key": "pref:cli_language",
+  "memory_type": "preference",
+  "active_version_id": "uuid",
+  "value_json": { "value": "Rust" },
+  "evidence_record_ids": ["uuid"]
+}
+```
+
+## GET /v1/memory/{canonical_key}/history
+
+Returns full version history for a memory item.
+
+Response `200`:
+
+```json
+{
+  "memory_item_id": "uuid",
+  "canonical_key": "pref:cli_language",
+  "memory_type": "preference",
+  "versions": [
+    {
+      "version_id": "uuid",
+      "version_number": 2,
+      "state": "active",
+      "value_json": { "value": "Rust" },
+      "supersedes_version_id": "uuid",
+      "valid_from": "2026-02-16T01:00:01+00:00",
+      "valid_to": null,
+      "created_at": "2026-02-16T01:00:01+00:00",
+      "evidence_record_ids": ["uuid"]
+    }
+  ]
+}
+```
+
+## POST /v1/memory/forget
+
+Hard-removes a memory item and its versions. By default, unreferenced linked evidence records are deleted too.
+
+Request:
+
+```json
+{
+  "canonical_key": "pref:cli_language",
+  "forget_evidence": true
+}
+```
+
+Response `200`:
+
+```json
+{
+  "canonical_key": "pref:cli_language",
+  "deleted_memory_item_id": "uuid",
+  "deleted_versions": 2,
+  "deleted_links": 2,
+  "deleted_evidence": 1
+}
+```
+
 ## Error Patterns
 
 - `400`: invalid request fields or missing evidence IDs.
