@@ -24,12 +24,15 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - Defined 12-week phased implementation roadmap.
 - Established module boundaries (ingest, evidence, compiler, policy, MCP, UI).
 - Established MVP boundaries and GitHub issue/milestone strategy.
+- Initialized git repository on `main`.
+- Created initial commit: `200dc1b`.
+- Verified GitHub CLI is installed; authentication is still required before remote creation/push.
 
 ## Progress Tracker
 
 - [x] Master vision captured
 - [x] Build roadmap drafted
-- [ ] Repository initialized and pushed to GitHub
+- [ ] Repository initialized and pushed to GitHub (initialized locally, push pending GitHub auth)
 - [ ] Core service scaffolded
 - [ ] Schema and migrations implemented
 - [ ] Evidence ingestion v1 implemented
