@@ -146,6 +146,71 @@ Response `200`:
 }
 ```
 
+## POST /v1/retention/policies/upsert
+
+Create/update a retention decay policy.
+
+Request:
+
+```json
+{
+  "policy_name": "project-decay-30d",
+  "memory_type": "project",
+  "canonical_prefix": "project:",
+  "max_age_days": 30,
+  "forget_evidence": false,
+  "enabled": true
+}
+```
+
+Response `200`:
+
+```json
+{
+  "policy_name": "project-decay-30d",
+  "memory_type": "project",
+  "canonical_prefix": "project:",
+  "max_age_days": 30,
+  "forget_evidence": false,
+  "enabled": true,
+  "updated_at": "2026-02-16T02:00:00+00:00"
+}
+```
+
+## POST /v1/retention/jobs/run
+
+Runs enabled retention policies (or specific policy names).
+
+Request:
+
+```json
+{
+  "policy_names": ["project-decay-30d"],
+  "dry_run": false
+}
+```
+
+Response `200`:
+
+```json
+{
+  "run_at": "2026-02-16T02:00:01+00:00",
+  "dry_run": false,
+  "policies": [
+    {
+      "policy_name": "project-decay-30d",
+      "job_id": "uuid",
+      "matched_memory_items": 3,
+      "deleted_memory_items": 3,
+      "deleted_versions": 5,
+      "deleted_links": 5,
+      "deleted_evidence": 0,
+      "status": "completed"
+    }
+  ]
+}
+```
+
 ## Error Patterns
 
 - `400`: invalid request fields or missing evidence IDs.

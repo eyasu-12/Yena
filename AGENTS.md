@@ -89,6 +89,13 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - history returns version timeline with evidence links
   - forget removes memory item/versions/links
   - forget removes now-unreferenced linked evidence when `forget_evidence=true`
+- Added retention policy execution to align with memory-decay governance:
+  - `POST /v1/retention/policies/upsert`
+  - `POST /v1/retention/jobs/run`
+- Verified live retention behavior:
+  - dry run reports matched stale memories without deletion
+  - execute run deletes matching stale project memories while preserving non-matching memories
+  - retention job status persisted in `retention_jobs`
 
 ## Progress Tracker
 
@@ -100,7 +107,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Evidence ingestion v1 implemented
 - [x] Memory compiler v1 implemented
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
-- [~] Governance primitives implemented (forget command API complete; retention jobs/UI pending)
+- [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

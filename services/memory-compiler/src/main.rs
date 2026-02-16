@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,6 +134,88 @@ struct MemoryVersionHistoryEntry {
     evidence_record_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpsertRetentionPolicyRequest {
+    policy_name: String,
+    memory_type: Option<String>,
+    canonical_prefix: Option<String>,
+    max_age_days: i64,
+    #[serde(default)]
+    forget_evidence: bool,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+impl UpsertRetentionPolicyRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.policy_name.trim().is_empty() {
+            return Err(ApiError::bad_request("policy_name is required"));
+        }
+        if self.policy_name.len() > 128 {
+            return Err(ApiError::bad_request("policy_name exceeds 128 chars"));
+        }
+        if self.max_age_days < 1 {
+            return Err(ApiError::bad_request("max_age_days must be >= 1"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpsertRetentionPolicyResponse {
+    policy_name: String,
+    memory_type: Option<String>,
+    canonical_prefix: Option<String>,
+    max_age_days: i64,
+    forget_evidence: bool,
+    enabled: bool,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunRetentionRequest {
+    #[serde(default)]
+    policy_names: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RunRetentionResponse {
+    run_at: String,
+    dry_run: bool,
+    policies: Vec<RetentionRunPolicyResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetentionRunPolicyResult {
+    policy_name: String,
+    job_id: String,
+    matched_memory_items: usize,
+    deleted_memory_items: usize,
+    deleted_versions: usize,
+    deleted_links: usize,
+    deleted_evidence: usize,
+    status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct RetentionPolicyPayload {
+    policy_name: String,
+    memory_type: Option<String>,
+    canonical_prefix: Option<String>,
+    max_age_days: i64,
+    #[serde(default)]
+    forget_evidence: bool,
+}
+
+#[derive(Debug, Default)]
+struct DeleteCounts {
+    deleted_versions: usize,
+    deleted_links: usize,
+    deleted_evidence: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -224,6 +306,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory/{canonical_key}", get(get_memory))
         .route("/v1/memory/{canonical_key}/history", get(get_memory_history))
         .route("/v1/memory/forget", post(forget_memory))
+        .route("/v1/retention/policies/upsert", post(upsert_retention_policy))
+        .route("/v1/retention/jobs/run", post(run_retention_jobs))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -587,59 +671,7 @@ async fn forget_memory(
         .map_err(|e| ApiError::internal(format!("failed to lookup memory item: {}", e)))?;
 
     let memory_item_id = memory_item_id.ok_or_else(|| ApiError::not_found("memory item not found"))?;
-
-    let version_ids = load_version_ids_for_item(&tx, &memory_item_id)?;
-    let linked_evidence_ids = load_evidence_ids_for_versions(&tx, &version_ids)?;
-
-    let deleted_links = tx
-        .execute(
-            "
-            DELETE FROM memory_links
-            WHERE memory_item_version_id IN (
-              SELECT id FROM memory_item_versions WHERE memory_item_id = ?1
-            )
-            ",
-            params![&memory_item_id],
-        )
-        .map_err(|e| ApiError::internal(format!("failed to delete memory links: {}", e)))?;
-
-    let deleted_versions = tx
-        .execute(
-            "DELETE FROM memory_item_versions WHERE memory_item_id = ?1",
-            params![&memory_item_id],
-        )
-        .map_err(|e| ApiError::internal(format!("failed to delete memory versions: {}", e)))?;
-
-    tx.execute("DELETE FROM memory_items WHERE id = ?1", params![&memory_item_id])
-        .map_err(|e| ApiError::internal(format!("failed to delete memory item: {}", e)))?;
-
-    let mut deleted_evidence = 0usize;
-    if payload.forget_evidence {
-        for evidence_id in linked_evidence_ids {
-            let still_linked: Option<String> = tx
-                .query_row(
-                    "
-                    SELECT evidence_record_id
-                    FROM memory_links
-                    WHERE evidence_record_id = ?1
-                    LIMIT 1
-                    ",
-                    params![&evidence_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| ApiError::internal(format!("failed evidence linkage lookup: {}", e)))?;
-
-            if still_linked.is_none() {
-                deleted_evidence += tx
-                    .execute(
-                        "DELETE FROM evidence_records WHERE id = ?1",
-                        params![&evidence_id],
-                    )
-                    .map_err(|e| ApiError::internal(format!("failed to delete evidence record: {}", e)))?;
-            }
-        }
-    }
+    let counts = delete_memory_item_by_id_tx(&tx, &memory_item_id, payload.forget_evidence)?;
 
     tx.commit()
         .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
@@ -647,9 +679,136 @@ async fn forget_memory(
     Ok(Json(ForgetMemoryResponse {
         canonical_key: payload.canonical_key,
         deleted_memory_item_id: memory_item_id,
-        deleted_versions,
-        deleted_links,
-        deleted_evidence,
+        deleted_versions: counts.deleted_versions,
+        deleted_links: counts.deleted_links,
+        deleted_evidence: counts.deleted_evidence,
+    }))
+}
+
+async fn upsert_retention_policy(
+    State(state): State<AppState>,
+    Json(payload): Json<UpsertRetentionPolicyRequest>,
+) -> Result<Json<UpsertRetentionPolicyResponse>, ApiError> {
+    payload.validate()?;
+
+    let policy = RetentionPolicyPayload {
+        policy_name: payload.policy_name.trim().to_string(),
+        memory_type: trim_optional(payload.memory_type),
+        canonical_prefix: trim_optional(payload.canonical_prefix),
+        max_age_days: payload.max_age_days,
+        forget_evidence: payload.forget_evidence,
+    };
+
+    let now = Utc::now().to_rfc3339();
+    let rule_name = retention_rule_name(&policy.policy_name);
+    let rule_json = serde_json::to_string(&policy)
+        .map_err(|e| ApiError::internal(format!("failed to encode retention policy: {}", e)))?;
+
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+    tx.execute("DELETE FROM policy_rules WHERE rule_name = ?1", params![&rule_name])
+        .map_err(|e| ApiError::internal(format!("failed to delete existing policy: {}", e)))?;
+
+    tx.execute(
+        "
+        INSERT INTO policy_rules (id, rule_name, rule_json, enabled, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+        ",
+        params![
+            Uuid::new_v4().to_string(),
+            &rule_name,
+            &rule_json,
+            if payload.enabled { 1 } else { 0 },
+            &now,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to upsert retention policy: {}", e)))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(UpsertRetentionPolicyResponse {
+        policy_name: policy.policy_name,
+        memory_type: policy.memory_type,
+        canonical_prefix: policy.canonical_prefix,
+        max_age_days: policy.max_age_days,
+        forget_evidence: policy.forget_evidence,
+        enabled: payload.enabled,
+        updated_at: now,
+    }))
+}
+
+async fn run_retention_jobs(
+    State(state): State<AppState>,
+    Json(payload): Json<RunRetentionRequest>,
+) -> Result<Json<RunRetentionResponse>, ApiError> {
+    let run_at = Utc::now().to_rfc3339();
+    let run_at_dt = DateTime::parse_from_rfc3339(&run_at)
+        .map_err(|e| ApiError::internal(format!("failed to parse run time: {}", e)))?
+        .with_timezone(&Utc);
+
+    let conn = open_db(&state.db_path)?;
+    let policies = load_retention_policies(&conn, &payload.policy_names)?;
+    drop(conn);
+
+    let mut results = Vec::new();
+    for policy in policies {
+        let mut conn = open_db(&state.db_path)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+        let job_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "
+            INSERT INTO retention_jobs (id, policy_name, target_type, status, run_at, completed_at)
+            VALUES (?1, ?2, 'memory_item', 'running', ?3, NULL)
+            ",
+            params![&job_id, &policy.policy_name, &run_at],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to insert retention job: {}", e)))?;
+
+        let (matched, deleted_items, counts) =
+            apply_retention_policy(&tx, &policy, run_at_dt, payload.dry_run)?;
+
+        let status = if payload.dry_run {
+            "dry_run".to_string()
+        } else {
+            "completed".to_string()
+        };
+
+        tx.execute(
+            "
+            UPDATE retention_jobs
+            SET status = ?2, completed_at = ?3
+            WHERE id = ?1
+            ",
+            params![&job_id, &status, &run_at],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to update retention job: {}", e)))?;
+
+        tx.commit()
+            .map_err(|e| ApiError::internal(format!("failed to commit retention job: {}", e)))?;
+
+        results.push(RetentionRunPolicyResult {
+            policy_name: policy.policy_name,
+            job_id,
+            matched_memory_items: matched,
+            deleted_memory_items: deleted_items,
+            deleted_versions: counts.deleted_versions,
+            deleted_links: counts.deleted_links,
+            deleted_evidence: counts.deleted_evidence,
+            status,
+        });
+    }
+
+    Ok(Json(RunRetentionResponse {
+        run_at,
+        dry_run: payload.dry_run,
+        policies: results,
     }))
 }
 
@@ -806,6 +965,217 @@ fn load_evidence_ids_for_versions(
         }
     }
     Ok(evidence_ids)
+}
+
+fn delete_memory_item_by_id_tx(
+    conn: &Connection,
+    memory_item_id: &str,
+    forget_evidence: bool,
+) -> Result<DeleteCounts, ApiError> {
+    let version_ids = load_version_ids_for_item(conn, memory_item_id)?;
+    let linked_evidence_ids = load_evidence_ids_for_versions(conn, &version_ids)?;
+
+    let deleted_links = conn
+        .execute(
+            "
+            DELETE FROM memory_links
+            WHERE memory_item_version_id IN (
+              SELECT id FROM memory_item_versions WHERE memory_item_id = ?1
+            )
+            ",
+            params![memory_item_id],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to delete memory links: {}", e)))?;
+
+    let deleted_versions = conn
+        .execute(
+            "DELETE FROM memory_item_versions WHERE memory_item_id = ?1",
+            params![memory_item_id],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to delete memory versions: {}", e)))?;
+
+    let deleted_items = conn
+        .execute("DELETE FROM memory_items WHERE id = ?1", params![memory_item_id])
+        .map_err(|e| ApiError::internal(format!("failed to delete memory item: {}", e)))?;
+
+    if deleted_items == 0 {
+        return Err(ApiError::not_found("memory item not found"));
+    }
+
+    let mut deleted_evidence = 0usize;
+    if forget_evidence {
+        for evidence_id in linked_evidence_ids {
+            let still_linked: Option<String> = conn
+                .query_row(
+                    "
+                    SELECT evidence_record_id
+                    FROM memory_links
+                    WHERE evidence_record_id = ?1
+                    LIMIT 1
+                    ",
+                    params![&evidence_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| ApiError::internal(format!("failed evidence linkage lookup: {}", e)))?;
+
+            if still_linked.is_none() {
+                deleted_evidence += conn
+                    .execute(
+                        "DELETE FROM evidence_records WHERE id = ?1",
+                        params![&evidence_id],
+                    )
+                    .map_err(|e| ApiError::internal(format!("failed to delete evidence record: {}", e)))?;
+            }
+        }
+    }
+
+    Ok(DeleteCounts {
+        deleted_versions,
+        deleted_links,
+        deleted_evidence,
+    })
+}
+
+fn apply_retention_policy(
+    conn: &Connection,
+    policy: &RetentionPolicyPayload,
+    run_at: DateTime<Utc>,
+    dry_run: bool,
+) -> Result<(usize, usize, DeleteCounts), ApiError> {
+    let cutoff = run_at - Duration::days(policy.max_age_days);
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, canonical_key, memory_type, updated_at
+            FROM memory_items
+            WHERE status = 'active'
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare retention query: {}", e)))?;
+
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute retention query: {}", e)))?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (memory_item_id, canonical_key, memory_type, updated_at_raw) =
+            row.map_err(|e| ApiError::internal(format!("failed to read retention row: {}", e)))?;
+
+        if let Some(required_type) = &policy.memory_type {
+            if &memory_type != required_type {
+                continue;
+            }
+        }
+
+        if let Some(prefix) = &policy.canonical_prefix {
+            if !canonical_key.starts_with(prefix) {
+                continue;
+            }
+        }
+
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_raw)
+            .map_err(|e| ApiError::internal(format!("invalid memory updated_at: {}", e)))?
+            .with_timezone(&Utc);
+
+        if updated_at <= cutoff {
+            candidates.push(memory_item_id);
+        }
+    }
+
+    let matched_memory_items = candidates.len();
+
+    if dry_run {
+        return Ok((matched_memory_items, 0, DeleteCounts::default()));
+    }
+
+    let mut counts = DeleteCounts::default();
+    let mut deleted_memory_items = 0usize;
+
+    for memory_item_id in candidates {
+        let item_counts =
+            delete_memory_item_by_id_tx(conn, &memory_item_id, policy.forget_evidence)?;
+        deleted_memory_items += 1;
+        counts.deleted_versions += item_counts.deleted_versions;
+        counts.deleted_links += item_counts.deleted_links;
+        counts.deleted_evidence += item_counts.deleted_evidence;
+    }
+
+    Ok((matched_memory_items, deleted_memory_items, counts))
+}
+
+fn load_retention_policies(
+    conn: &Connection,
+    requested_policy_names: &[String],
+) -> Result<Vec<RetentionPolicyPayload>, ApiError> {
+    let requested: BTreeSet<String> = requested_policy_names
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT rule_json
+            FROM policy_rules
+            WHERE rule_name LIKE 'retention/%' AND enabled = 1
+            ORDER BY updated_at DESC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare policy query: {}", e)))?;
+
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to execute policy query: {}", e)))?;
+
+    let mut policies = Vec::new();
+    for row in rows {
+        let raw_json =
+            row.map_err(|e| ApiError::internal(format!("failed to read policy row: {}", e)))?;
+        let policy: RetentionPolicyPayload = serde_json::from_str(&raw_json)
+            .map_err(|e| ApiError::internal(format!("failed to decode retention policy: {}", e)))?;
+
+        if requested.is_empty() || requested.contains(&policy.policy_name) {
+            policies.push(policy);
+        }
+    }
+
+    if !requested.is_empty() {
+        let loaded: BTreeSet<String> = policies.iter().map(|p| p.policy_name.clone()).collect();
+        let missing: Vec<String> = requested
+            .iter()
+            .filter(|name| !loaded.contains(*name))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "unknown retention policy names: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    Ok(policies)
+}
+
+fn retention_rule_name(policy_name: &str) -> String {
+    format!("retention/{}", policy_name)
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn default_true() -> bool {
