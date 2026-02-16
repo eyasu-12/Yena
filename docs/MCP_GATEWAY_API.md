@@ -25,6 +25,7 @@ Supported tools for `tools/call`:
 - `yena.connect`
 - `yena.retrieve`
 - `yena.graph.retrieve`
+- `yena.audit.list`
 - `yena.scope.upsert`
 - `yena.policy.redact_keys`
 
@@ -166,3 +167,36 @@ Response:
 ```
 
 Graph retrieval writes `retrieval_audit_events` with `request_type = graph_retrieve`.
+
+## POST /v1/audit/events/list
+
+List recent retrieval audit events for verifiable privacy.
+
+Request:
+
+```json
+{
+  "limit": 50,
+  "agent_id": "audit-agent",
+  "request_type": "retrieve"
+}
+```
+
+Response:
+
+```json
+{
+  "returned": 1,
+  "events": [
+    {
+      "id": "uuid",
+      "agent_id": "audit-agent",
+      "request_type": "retrieve",
+      "scope_applied": "all-context",
+      "shared_json": { "count": 1, "memory_item_ids": ["uuid"] },
+      "redacted_json": { "entries": [{ "memory_item_id": "uuid", "redacted_fields": ["email"] }] },
+      "created_at": "2026-02-16T03:38:43+00:00"
+    }
+  ]
+}
+```

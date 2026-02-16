@@ -59,6 +59,13 @@ struct GraphRetrieveRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListAuditEventsRequest {
+    limit: Option<usize>,
+    agent_id: Option<String>,
+    request_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpsertRedactPolicyRequest {
     keys: Vec<String>,
 }
@@ -141,6 +148,23 @@ struct GraphRetrieveResponse {
     agent_id: String,
     returned: usize,
     relationships: Vec<GraphRelationshipProjection>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEventView {
+    id: String,
+    agent_id: String,
+    request_type: String,
+    scope_applied: String,
+    shared_json: Value,
+    redacted_json: Option<Value>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListAuditEventsResponse {
+    returned: usize,
+    events: Vec<AuditEventView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/connect", post(connect))
         .route("/v1/retrieve", post(retrieve))
         .route("/v1/graph/retrieve", post(graph_retrieve))
+        .route("/v1/audit/events/list", post(list_audit_events))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -305,6 +330,7 @@ async fn mcp_rpc(
         "yena.connect"
         | "yena.retrieve"
         | "yena.graph.retrieve"
+        | "yena.audit.list"
         | "yena.scope.upsert"
         | "yena.policy.redact_keys" => {
             execute_tool_call(state, request.id, &request.method, request.params).await
@@ -346,6 +372,15 @@ async fn execute_tool_call(state: AppState, id: Value, name: &str, args: Value) 
             )
             .await
         }
+        "yena.audit.list" => parse_and_execute::<
+            ListAuditEventsRequest,
+            ListAuditEventsResponse,
+            _,
+            _,
+        >(state, args, |state, payload| async move {
+            list_audit_events(State(state), Json(payload)).await
+        })
+        .await,
         "yena.scope.upsert" => {
             parse_and_execute::<UpsertScopeRequest, UpsertScopeResponse, _, _>(
                 state,
@@ -442,6 +477,18 @@ fn mcp_tools_catalog() -> Value {
                     "agent_id": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "entity_canonical_name": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "yena.audit.list",
+            "description": "List recent audit events for retrieval/redaction visibility.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "agent_id": { "type": "string" },
+                    "request_type": { "type": "string" }
                 }
             }
         },
@@ -780,9 +827,11 @@ async fn graph_retrieve(
     let mut projections = Vec::new();
 
     for row in rows {
-        let attributes_value: Value = serde_json::from_str(&row.attributes_json)
-            .map_err(|e| ApiError::internal(format!("failed to decode graph attributes_json: {}", e)))?;
-        let (redacted_attributes, redacted_fields) = apply_redaction(attributes_value, &redaction_keys);
+        let attributes_value: Value = serde_json::from_str(&row.attributes_json).map_err(|e| {
+            ApiError::internal(format!("failed to decode graph attributes_json: {}", e))
+        })?;
+        let (redacted_attributes, redacted_fields) =
+            apply_redaction(attributes_value, &redaction_keys);
 
         projections.push(GraphRelationshipProjection {
             relationship_id: row.relationship_id,
@@ -834,6 +883,63 @@ async fn graph_retrieve(
         agent_id: payload.agent_id,
         returned: projections.len(),
         relationships: projections,
+    }))
+}
+
+async fn list_audit_events(
+    State(state): State<AppState>,
+    Json(payload): Json<ListAuditEventsRequest>,
+) -> Result<Json<ListAuditEventsResponse>, ApiError> {
+    let limit = payload.limit.unwrap_or(50).clamp(1, 500) as i64;
+
+    let conn = open_db(&state.db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, agent_id, request_type, scope_applied, shared_json, redacted_json, created_at
+            FROM retrieval_audit_events
+            WHERE (?1 IS NULL OR agent_id = ?1)
+              AND (?2 IS NULL OR request_type = ?2)
+            ORDER BY created_at DESC
+            LIMIT ?3
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare audit query: {}", e)))?;
+
+    let agent_id = payload
+        .agent_id
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let request_type = payload
+        .request_type
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let rows = stmt
+        .query_map(params![agent_id, request_type, limit], |r| {
+            Ok(AuditEventView {
+                id: r.get(0)?,
+                agent_id: r.get(1)?,
+                request_type: r.get(2)?,
+                scope_applied: r.get(3)?,
+                shared_json: parse_json_or_raw(&r.get::<_, String>(4)?),
+                redacted_json: r
+                    .get::<_, Option<String>>(5)?
+                    .map(|v| parse_json_or_raw(&v)),
+                created_at: r.get(6)?,
+            })
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute audit query: {}", e)))?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    let events =
+        collected.map_err(|e| ApiError::internal(format!("failed to parse audit rows: {}", e)))?;
+
+    Ok(Json(ListAuditEventsResponse {
+        returned: events.len(),
+        events,
     }))
 }
 
@@ -986,6 +1092,10 @@ fn load_active_graph_relationships(
 
     let collected: Result<Vec<_>, _> = rows.collect();
     collected.map_err(|e| ApiError::internal(format!("failed to parse graph rows: {}", e)))
+}
+
+fn parse_json_or_raw(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
 }
 
 fn apply_redaction(value: Value, keys: &BTreeSet<String>) -> (Value, Vec<String>) {

@@ -115,6 +115,12 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - scope gate requires `graph` (or `relationship`) in allowed memory types
   - redaction policy applies to graph relationship attributes
   - graph retrieval writes audit events with `request_type = graph_retrieve`
+- Added audit visibility APIs/tools:
+  - `POST /v1/audit/events/list`
+  - MCP tool: `yena.audit.list`
+- Verified audit listing behavior:
+  - returns both `retrieve` and `graph_retrieve` events
+  - exposes shared/redacted payload summaries for dashboard-style privacy inspection
 
 ## Progress Tracker
 
@@ -129,6 +135,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema + versioned relationship compiler complete; graph-aware retrieval in MCP pending)
 - [~] Smart memory foundation implemented (graph schema + versioned relationship compiler + MCP graph retrieval complete; graph traversal/ranking improvements pending)
+- [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 
