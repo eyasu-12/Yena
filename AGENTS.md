@@ -108,6 +108,13 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - graph proposal commit creates relationship version
   - second commit supersedes first version
   - history returns full temporal edge lifecycle with evidence links
+- Extended `mcp-gateway` with graph-aware retrieval:
+  - `POST /v1/graph/retrieve`
+  - MCP tool: `yena.graph.retrieve`
+- Verified graph retrieval governance behavior:
+  - scope gate requires `graph` (or `relationship`) in allowed memory types
+  - redaction policy applies to graph relationship attributes
+  - graph retrieval writes audit events with `request_type = graph_retrieve`
 
 ## Progress Tracker
 
@@ -121,6 +128,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema + versioned relationship compiler complete; graph-aware retrieval in MCP pending)
+- [~] Smart memory foundation implemented (graph schema + versioned relationship compiler + MCP graph retrieval complete; graph traversal/ranking improvements pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

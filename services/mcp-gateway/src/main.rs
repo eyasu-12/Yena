@@ -52,6 +52,13 @@ struct RetrieveRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphRetrieveRequest {
+    agent_id: String,
+    limit: Option<usize>,
+    entity_canonical_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpsertRedactPolicyRequest {
     keys: Vec<String>,
 }
@@ -110,6 +117,30 @@ struct RetrieveResponse {
     agent_id: String,
     returned: usize,
     memories: Vec<MemoryProjection>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphEntityProjection {
+    entity_type: String,
+    canonical_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphRelationshipProjection {
+    relationship_id: String,
+    version_id: String,
+    subject: GraphEntityProjection,
+    predicate: String,
+    object: GraphEntityProjection,
+    attributes_json: Value,
+    redacted_fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphRetrieveResponse {
+    agent_id: String,
+    returned: usize,
+    relationships: Vec<GraphRelationshipProjection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +207,18 @@ struct MemoryRow {
     value_json: String,
 }
 
+#[derive(Debug)]
+struct GraphRelationshipRow {
+    relationship_id: String,
+    version_id: String,
+    subject_entity_type: String,
+    subject_canonical_name: String,
+    predicate: String,
+    object_entity_type: String,
+    object_canonical_name: String,
+    attributes_json: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -202,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/policies/redact-keys", post(upsert_redact_policy))
         .route("/v1/connect", post(connect))
         .route("/v1/retrieve", post(retrieve))
+        .route("/v1/graph/retrieve", post(graph_retrieve))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -258,7 +302,11 @@ async fn mcp_rpc(
             ),
         },
         // Direct calls are useful for development/testing and mirror tool names.
-        "yena.connect" | "yena.retrieve" | "yena.scope.upsert" | "yena.policy.redact_keys" => {
+        "yena.connect"
+        | "yena.retrieve"
+        | "yena.graph.retrieve"
+        | "yena.scope.upsert"
+        | "yena.policy.redact_keys" => {
             execute_tool_call(state, request.id, &request.method, request.params).await
         }
         _ => rpc_error(
@@ -287,6 +335,14 @@ async fn execute_tool_call(state: AppState, id: Value, name: &str, args: Value) 
                 state,
                 args,
                 |state, payload| async move { retrieve(State(state), Json(payload)).await },
+            )
+            .await
+        }
+        "yena.graph.retrieve" => {
+            parse_and_execute::<GraphRetrieveRequest, GraphRetrieveResponse, _, _>(
+                state,
+                args,
+                |state, payload| async move { graph_retrieve(State(state), Json(payload)).await },
             )
             .await
         }
@@ -373,6 +429,19 @@ fn mcp_tools_catalog() -> Value {
                     "agent_id": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "canonical_prefix": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "yena.graph.retrieve",
+            "description": "Retrieve scoped graph relationships for an agent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent_id"],
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+                    "entity_canonical_name": { "type": "string" }
                 }
             }
         },
@@ -648,8 +717,9 @@ async fn retrieve(
         "memory_item_ids": projections.iter().map(|m| m.memory_item_id.clone()).collect::<Vec<_>>()
     });
 
-    insert_retrieval_audit(
+    insert_audit_event(
         &conn,
+        "retrieve",
         &payload.agent_id,
         &scope_names,
         &shared_summary,
@@ -660,6 +730,110 @@ async fn retrieve(
         agent_id: payload.agent_id,
         returned: projections.len(),
         memories: projections,
+    }))
+}
+
+async fn graph_retrieve(
+    State(state): State<AppState>,
+    Json(payload): Json<GraphRetrieveRequest>,
+) -> Result<Json<GraphRetrieveResponse>, ApiError> {
+    if payload.agent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("agent_id is required"));
+    }
+
+    let limit = payload.limit.unwrap_or(20).min(200);
+    let entity_filter = payload
+        .entity_canonical_name
+        .as_ref()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty());
+
+    let conn = open_db(&state.db_path)?;
+    let scopes = load_scopes(&conn, &payload.agent_id)?;
+    let redaction_keys = load_redaction_keys(&conn)?;
+
+    let scope_names: Vec<String> = scopes.iter().map(|s| s.scope_name.clone()).collect();
+    let allowed_memory_types: BTreeSet<String> = scopes
+        .iter()
+        .flat_map(|s| s.payload.allowed_memory_types.clone())
+        .map(|v| v.trim().to_lowercase())
+        .collect();
+
+    if !allowed_memory_types.contains("graph") && !allowed_memory_types.contains("relationship") {
+        insert_audit_event(
+            &conn,
+            "graph_retrieve",
+            &payload.agent_id,
+            &scope_names,
+            &json!({"count": 0, "relationship_ids": []}),
+            &json!({"entries": []}),
+        )?;
+
+        return Ok(Json(GraphRetrieveResponse {
+            agent_id: payload.agent_id,
+            returned: 0,
+            relationships: vec![],
+        }));
+    }
+
+    let rows = load_active_graph_relationships(&conn, entity_filter.as_deref())?;
+    let mut projections = Vec::new();
+
+    for row in rows {
+        let attributes_value: Value = serde_json::from_str(&row.attributes_json)
+            .map_err(|e| ApiError::internal(format!("failed to decode graph attributes_json: {}", e)))?;
+        let (redacted_attributes, redacted_fields) = apply_redaction(attributes_value, &redaction_keys);
+
+        projections.push(GraphRelationshipProjection {
+            relationship_id: row.relationship_id,
+            version_id: row.version_id,
+            subject: GraphEntityProjection {
+                entity_type: row.subject_entity_type,
+                canonical_name: row.subject_canonical_name,
+            },
+            predicate: row.predicate,
+            object: GraphEntityProjection {
+                entity_type: row.object_entity_type,
+                canonical_name: row.object_canonical_name,
+            },
+            attributes_json: redacted_attributes,
+            redacted_fields,
+        });
+
+        if projections.len() >= limit {
+            break;
+        }
+    }
+
+    let redaction_summary: Vec<Value> = projections
+        .iter()
+        .filter(|m| !m.redacted_fields.is_empty())
+        .map(|m| {
+            json!({
+                "relationship_id": m.relationship_id,
+                "redacted_fields": m.redacted_fields,
+            })
+        })
+        .collect();
+
+    let shared_summary = json!({
+        "count": projections.len(),
+        "relationship_ids": projections.iter().map(|r| r.relationship_id.clone()).collect::<Vec<_>>()
+    });
+
+    insert_audit_event(
+        &conn,
+        "graph_retrieve",
+        &payload.agent_id,
+        &scope_names,
+        &shared_summary,
+        &json!({"entries": redaction_summary}),
+    )?;
+
+    Ok(Json(GraphRetrieveResponse {
+        agent_id: payload.agent_id,
+        returned: projections.len(),
+        relationships: projections,
     }))
 }
 
@@ -768,6 +942,52 @@ fn load_active_memories(conn: &Connection) -> Result<Vec<MemoryRow>, ApiError> {
     collected.map_err(|e| ApiError::internal(format!("failed to parse memory rows: {}", e)))
 }
 
+fn load_active_graph_relationships(
+    conn: &Connection,
+    entity_canonical_name: Option<&str>,
+) -> Result<Vec<GraphRelationshipRow>, ApiError> {
+    let query = "
+        SELECT
+          gr.id,
+          grv.id,
+          se.entity_type,
+          se.canonical_name,
+          gr.predicate,
+          oe.entity_type,
+          oe.canonical_name,
+          grv.attributes_json
+        FROM graph_relationships gr
+        JOIN graph_relationship_versions grv ON grv.id = gr.active_version_id
+        JOIN graph_entities se ON se.id = gr.subject_entity_id
+        JOIN graph_entities oe ON oe.id = gr.object_entity_id
+        WHERE gr.status = 'active'
+          AND (?1 IS NULL OR se.canonical_name = ?1 OR oe.canonical_name = ?1)
+        ORDER BY gr.updated_at DESC
+    ";
+
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|e| ApiError::internal(format!("failed to prepare graph query: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![entity_canonical_name], |row| {
+            Ok(GraphRelationshipRow {
+                relationship_id: row.get(0)?,
+                version_id: row.get(1)?,
+                subject_entity_type: row.get(2)?,
+                subject_canonical_name: row.get(3)?,
+                predicate: row.get(4)?,
+                object_entity_type: row.get(5)?,
+                object_canonical_name: row.get(6)?,
+                attributes_json: row.get(7)?,
+            })
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute graph query: {}", e)))?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    collected.map_err(|e| ApiError::internal(format!("failed to parse graph rows: {}", e)))
+}
+
 fn apply_redaction(value: Value, keys: &BTreeSet<String>) -> (Value, Vec<String>) {
     if keys.is_empty() {
         return (value, Vec::new());
@@ -790,8 +1010,9 @@ fn apply_redaction(value: Value, keys: &BTreeSet<String>) -> (Value, Vec<String>
     (updated, redacted)
 }
 
-fn insert_retrieval_audit(
+fn insert_audit_event(
     conn: &Connection,
+    request_type: &str,
     agent_id: &str,
     scope_names: &[String],
     shared_summary: &Value,
@@ -801,11 +1022,12 @@ fn insert_retrieval_audit(
         "
         INSERT INTO retrieval_audit_events (
           id, agent_id, request_type, scope_applied, shared_json, redacted_json, created_at
-        ) VALUES (?1, ?2, 'retrieve', ?3, ?4, ?5, ?6)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
         params![
             Uuid::new_v4().to_string(),
             agent_id,
+            request_type,
             if scope_names.is_empty() {
                 "none".to_string()
             } else {
@@ -822,7 +1044,7 @@ fn insert_retrieval_audit(
             Utc::now().to_rfc3339(),
         ],
     )
-    .map_err(|e| ApiError::internal(format!("failed to insert retrieval audit: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("failed to insert audit event: {}", e)))?;
 
     Ok(())
 }

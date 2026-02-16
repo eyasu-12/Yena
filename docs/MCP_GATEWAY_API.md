@@ -24,6 +24,7 @@ Supported tools for `tools/call`:
 
 - `yena.connect`
 - `yena.retrieve`
+- `yena.graph.retrieve`
 - `yena.scope.upsert`
 - `yena.policy.redact_keys`
 
@@ -129,3 +130,39 @@ Response:
 ```
 
 Every retrieve call writes a `retrieval_audit_events` row describing scope, shared IDs, and redactions.
+
+## POST /v1/graph/retrieve
+
+Retrieve active graph relationships with scope filtering and redaction.
+
+Request:
+
+```json
+{
+  "agent_id": "graph-agent",
+  "entity_canonical_name": "eyasu",
+  "limit": 10
+}
+```
+
+Response:
+
+```json
+{
+  "agent_id": "graph-agent",
+  "returned": 1,
+  "relationships": [
+    {
+      "relationship_id": "uuid",
+      "version_id": "uuid",
+      "subject": { "entity_type": "person", "canonical_name": "eyasu" },
+      "predicate": "prefers",
+      "object": { "entity_type": "language", "canonical_name": "rust" },
+      "attributes_json": { "source": "manual" },
+      "redacted_fields": ["strength"]
+    }
+  ]
+}
+```
+
+Graph retrieval writes `retrieval_audit_events` with `request_type = graph_retrieve`.
