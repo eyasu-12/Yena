@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+
+# env
+.env
+.env.*
+
+# logs
+*.log
+
+# sqlite
+data/
+*.sqlite
+*.db
+
+# rust
+target/
+Cargo.lock

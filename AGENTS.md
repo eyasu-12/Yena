@@ -26,15 +26,24 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - Established MVP boundaries and GitHub issue/milestone strategy.
 - Initialized git repository on `main`.
 - Created initial commit: `200dc1b`.
-- Verified GitHub CLI is installed; authentication is still required before remote creation/push.
+- Connected repository to GitHub remote `origin` (`https://github.com/eyasu-12/Yena.git`).
+- Added Phase 0 foundation files:
+  - `README.md`
+  - `docs/ARCHITECTURE.md`
+  - `docs/THREAT_MODEL.md`
+  - `db/migrations/0001_init.sql`
+  - `db/migrations/0002_indexes.sql`
+  - `.github/ISSUE_TEMPLATE/feature_request.md`
+  - `.github/ISSUE_TEMPLATE/bug_report.md`
+- Noted local toolchain gap: Rust/Cargo is not installed yet.
 
 ## Progress Tracker
 
 - [x] Master vision captured
 - [x] Build roadmap drafted
-- [ ] Repository initialized and pushed to GitHub (initialized locally, push pending GitHub auth)
+- [x] Repository initialized and pushed to GitHub
 - [ ] Core service scaffolded
-- [ ] Schema and migrations implemented
+- [x] Schema and migrations implemented
 - [ ] Evidence ingestion v1 implemented
 - [ ] Memory compiler v1 implemented
 - [ ] MCP gateway v1 implemented
