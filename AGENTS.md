@@ -36,13 +36,21 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `.github/ISSUE_TEMPLATE/feature_request.md`
   - `.github/ISSUE_TEMPLATE/bug_report.md`
 - Noted local toolchain gap: Rust/Cargo is not installed yet.
+- Added Rust workspace skeleton:
+  - `Cargo.toml` workspace manifest
+  - `crates/yena-model`
+  - `services/ingest-service`
+  - `services/memory-compiler`
+  - `services/mcp-gateway`
+  - `services/policy-engine`
+- Validated SQLite migrations against a local test DB.
 
 ## Progress Tracker
 
 - [x] Master vision captured
 - [x] Build roadmap drafted
 - [x] Repository initialized and pushed to GitHub
-- [ ] Core service scaffolded
+- [x] Core service scaffolded
 - [x] Schema and migrations implemented
 - [ ] Evidence ingestion v1 implemented
 - [ ] Memory compiler v1 implemented

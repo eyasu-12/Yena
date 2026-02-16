@@ -17,7 +17,7 @@ Yena is a local-first memory control plane for agentic systems.
 - [x] Git initialized and connected to GitHub
 - [x] Baseline architecture and threat model docs
 - [x] Initial SQLite schema migration
-- [ ] Runtime scaffolding (Rust workspace)
+- [x] Runtime scaffolding (Rust workspace)
 - [ ] CI and tests
 
 ## Next Commands
@@ -34,4 +34,14 @@ curl https://sh.rustup.rs -sSf | sh
 cargo install sqlx-cli --no-default-features --features sqlite
 ```
 
-3. Create first service crates (`ingest-service`, `memory-compiler`, `mcp-gateway`).
+3. Build workspace:
+
+```bash
+cargo build
+```
+
+4. Start first implementation milestone:
+
+```bash
+# implement evidence append-only API in services/ingest-service
+```
