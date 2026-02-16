@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, env, net::SocketAddr};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, VecDeque},
+    env,
+    net::SocketAddr,
+};
 
 use axum::{
     extract::State,
@@ -7,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,6 +61,10 @@ struct GraphRetrieveRequest {
     agent_id: String,
     limit: Option<usize>,
     entity_canonical_name: Option<String>,
+    #[serde(default)]
+    seed_entities: Vec<String>,
+    max_hops: Option<usize>,
+    rank_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +150,8 @@ struct GraphRelationshipProjection {
     object: GraphEntityProjection,
     attributes_json: Value,
     redacted_fields: Vec<String>,
+    hop_distance: Option<usize>,
+    rank_score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,7 +242,7 @@ struct MemoryRow {
     value_json: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GraphRelationshipRow {
     relationship_id: String,
     version_id: String,
@@ -241,6 +252,20 @@ struct GraphRelationshipRow {
     object_entity_type: String,
     object_canonical_name: String,
     attributes_json: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphRankBy {
+    HopThenRecency,
+    Recency,
+}
+
+#[derive(Debug)]
+struct RankedGraphRow {
+    row: GraphRelationshipRow,
+    hop_distance: Option<usize>,
+    rank_score: f64,
 }
 
 #[tokio::main]
@@ -476,7 +501,16 @@ fn mcp_tools_catalog() -> Value {
                 "properties": {
                     "agent_id": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
-                    "entity_canonical_name": { "type": "string" }
+                    "entity_canonical_name": { "type": "string" },
+                    "seed_entities": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "max_hops": { "type": "integer", "minimum": 1, "maximum": 4 },
+                    "rank_by": {
+                        "type": "string",
+                        "enum": ["hop_then_recency", "recency"]
+                    }
                 }
             }
         },
@@ -789,11 +823,12 @@ async fn graph_retrieve(
     }
 
     let limit = payload.limit.unwrap_or(20).min(200);
-    let entity_filter = payload
-        .entity_canonical_name
-        .as_ref()
-        .map(|v| v.trim().to_lowercase())
-        .filter(|v| !v.is_empty());
+    let max_hops = payload.max_hops.unwrap_or(1).clamp(1, 4);
+    let rank_by = parse_graph_rank_by(payload.rank_by.as_deref())?;
+    let seed_entities = collect_seed_entities(
+        payload.entity_canonical_name.as_deref(),
+        &payload.seed_entities,
+    );
 
     let conn = open_db(&state.db_path)?;
     let scopes = load_scopes(&conn, &payload.agent_id)?;
@@ -823,35 +858,35 @@ async fn graph_retrieve(
         }));
     }
 
-    let rows = load_active_graph_relationships(&conn, entity_filter.as_deref())?;
+    let rows = load_active_graph_relationships(&conn)?;
+    let ranked_rows = rank_graph_relationships(rows, &seed_entities, max_hops, rank_by)?;
     let mut projections = Vec::new();
 
-    for row in rows {
-        let attributes_value: Value = serde_json::from_str(&row.attributes_json).map_err(|e| {
-            ApiError::internal(format!("failed to decode graph attributes_json: {}", e))
-        })?;
+    for ranked in ranked_rows.into_iter().take(limit) {
+        let attributes_value: Value =
+            serde_json::from_str(&ranked.row.attributes_json).map_err(|e| {
+                ApiError::internal(format!("failed to decode graph attributes_json: {}", e))
+            })?;
         let (redacted_attributes, redacted_fields) =
             apply_redaction(attributes_value, &redaction_keys);
 
         projections.push(GraphRelationshipProjection {
-            relationship_id: row.relationship_id,
-            version_id: row.version_id,
+            relationship_id: ranked.row.relationship_id,
+            version_id: ranked.row.version_id,
             subject: GraphEntityProjection {
-                entity_type: row.subject_entity_type,
-                canonical_name: row.subject_canonical_name,
+                entity_type: ranked.row.subject_entity_type,
+                canonical_name: ranked.row.subject_canonical_name,
             },
-            predicate: row.predicate,
+            predicate: ranked.row.predicate,
             object: GraphEntityProjection {
-                entity_type: row.object_entity_type,
-                canonical_name: row.object_canonical_name,
+                entity_type: ranked.row.object_entity_type,
+                canonical_name: ranked.row.object_canonical_name,
             },
             attributes_json: redacted_attributes,
             redacted_fields,
+            hop_distance: ranked.hop_distance,
+            rank_score: ranked.rank_score,
         });
-
-        if projections.len() >= limit {
-            break;
-        }
     }
 
     let redaction_summary: Vec<Value> = projections
@@ -867,7 +902,10 @@ async fn graph_retrieve(
 
     let shared_summary = json!({
         "count": projections.len(),
-        "relationship_ids": projections.iter().map(|r| r.relationship_id.clone()).collect::<Vec<_>>()
+        "relationship_ids": projections.iter().map(|r| r.relationship_id.clone()).collect::<Vec<_>>(),
+        "seed_entities": seed_entities,
+        "max_hops": max_hops,
+        "rank_by": graph_rank_by_name(rank_by),
     });
 
     insert_audit_event(
@@ -1050,7 +1088,6 @@ fn load_active_memories(conn: &Connection) -> Result<Vec<MemoryRow>, ApiError> {
 
 fn load_active_graph_relationships(
     conn: &Connection,
-    entity_canonical_name: Option<&str>,
 ) -> Result<Vec<GraphRelationshipRow>, ApiError> {
     let query = "
         SELECT
@@ -1061,13 +1098,13 @@ fn load_active_graph_relationships(
           gr.predicate,
           oe.entity_type,
           oe.canonical_name,
-          grv.attributes_json
+          grv.attributes_json,
+          gr.updated_at
         FROM graph_relationships gr
         JOIN graph_relationship_versions grv ON grv.id = gr.active_version_id
         JOIN graph_entities se ON se.id = gr.subject_entity_id
         JOIN graph_entities oe ON oe.id = gr.object_entity_id
         WHERE gr.status = 'active'
-          AND (?1 IS NULL OR se.canonical_name = ?1 OR oe.canonical_name = ?1)
         ORDER BY gr.updated_at DESC
     ";
 
@@ -1076,7 +1113,7 @@ fn load_active_graph_relationships(
         .map_err(|e| ApiError::internal(format!("failed to prepare graph query: {}", e)))?;
 
     let rows = stmt
-        .query_map(params![entity_canonical_name], |row| {
+        .query_map([], |row| {
             Ok(GraphRelationshipRow {
                 relationship_id: row.get(0)?,
                 version_id: row.get(1)?,
@@ -1086,12 +1123,190 @@ fn load_active_graph_relationships(
                 object_entity_type: row.get(5)?,
                 object_canonical_name: row.get(6)?,
                 attributes_json: row.get(7)?,
+                updated_at: row.get(8)?,
             })
         })
         .map_err(|e| ApiError::internal(format!("failed to execute graph query: {}", e)))?;
 
     let collected: Result<Vec<_>, _> = rows.collect();
     collected.map_err(|e| ApiError::internal(format!("failed to parse graph rows: {}", e)))
+}
+
+fn collect_seed_entities(
+    entity_canonical_name: Option<&str>,
+    seed_entities: &[String],
+) -> Vec<String> {
+    let mut dedup = BTreeSet::new();
+    if let Some(name) = entity_canonical_name {
+        let normalized = name.trim().to_lowercase();
+        if !normalized.is_empty() {
+            dedup.insert(normalized);
+        }
+    }
+    for seed in seed_entities {
+        let normalized = seed.trim().to_lowercase();
+        if !normalized.is_empty() {
+            dedup.insert(normalized);
+        }
+    }
+    dedup.into_iter().collect()
+}
+
+fn parse_graph_rank_by(value: Option<&str>) -> Result<GraphRankBy, ApiError> {
+    match value.map(|v| v.trim().to_lowercase()) {
+        None => Ok(GraphRankBy::HopThenRecency),
+        Some(v) if v.is_empty() => Ok(GraphRankBy::HopThenRecency),
+        Some(v) if v == "hop_then_recency" => Ok(GraphRankBy::HopThenRecency),
+        Some(v) if v == "recency" => Ok(GraphRankBy::Recency),
+        Some(v) => Err(ApiError::bad_request(format!(
+            "invalid rank_by '{}'; expected one of: hop_then_recency, recency",
+            v
+        ))),
+    }
+}
+
+fn graph_rank_by_name(rank_by: GraphRankBy) -> &'static str {
+    match rank_by {
+        GraphRankBy::HopThenRecency => "hop_then_recency",
+        GraphRankBy::Recency => "recency",
+    }
+}
+
+fn rank_graph_relationships(
+    rows: Vec<GraphRelationshipRow>,
+    seed_entities: &[String],
+    max_hops: usize,
+    rank_by: GraphRankBy,
+) -> Result<Vec<RankedGraphRow>, ApiError> {
+    let recency_seconds: Vec<i64> = rows
+        .iter()
+        .map(|row| {
+            DateTime::parse_from_rfc3339(&row.updated_at)
+                .map(|dt| dt.timestamp())
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "invalid graph updated_at '{}': {}",
+                        row.updated_at, e
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut ranked = if seed_entities.is_empty() {
+        rows.into_iter()
+            .enumerate()
+            .map(|(idx, row)| RankedGraphRow {
+                row,
+                hop_distance: None,
+                rank_score: recency_seconds[idx] as f64,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut adjacency: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, row) in rows.iter().enumerate() {
+            adjacency
+                .entry(row.subject_canonical_name.clone())
+                .or_default()
+                .push(idx);
+            adjacency
+                .entry(row.object_canonical_name.clone())
+                .or_default()
+                .push(idx);
+        }
+
+        let mut queue = VecDeque::new();
+        let mut entity_depth: HashMap<String, usize> = HashMap::new();
+        for seed in seed_entities {
+            entity_depth.insert(seed.clone(), 0);
+            queue.push_back(seed.clone());
+        }
+
+        let mut relationship_hops: HashMap<usize, usize> = HashMap::new();
+        while let Some(entity) = queue.pop_front() {
+            let depth = match entity_depth.get(&entity) {
+                Some(v) => *v,
+                None => continue,
+            };
+            if depth >= max_hops {
+                continue;
+            }
+
+            let Some(connected) = adjacency.get(&entity) else {
+                continue;
+            };
+
+            for rel_idx in connected {
+                let hop = depth + 1;
+                relationship_hops
+                    .entry(*rel_idx)
+                    .and_modify(|existing| {
+                        if hop < *existing {
+                            *existing = hop;
+                        }
+                    })
+                    .or_insert(hop);
+
+                let row = &rows[*rel_idx];
+                let neighbor = if row.subject_canonical_name == entity {
+                    row.object_canonical_name.clone()
+                } else {
+                    row.subject_canonical_name.clone()
+                };
+
+                let should_visit = match entity_depth.get(&neighbor) {
+                    Some(existing_depth) => hop < *existing_depth,
+                    None => true,
+                };
+                if should_visit {
+                    entity_depth.insert(neighbor.clone(), hop);
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        relationship_hops
+            .into_iter()
+            .map(|(idx, hop_distance)| RankedGraphRow {
+                row: rows[idx].clone(),
+                hop_distance: Some(hop_distance),
+                rank_score: 10_000_000.0 - ((hop_distance as f64) * 1_000_000.0)
+                    + (recency_seconds[idx] as f64),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    ranked.sort_by(|a, b| match rank_by {
+        GraphRankBy::Recency => compare_recency_then_hop(a, b),
+        GraphRankBy::HopThenRecency => compare_hop_then_recency(a, b),
+    });
+
+    Ok(ranked)
+}
+
+fn compare_hop_then_recency(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    let a_hop = a.hop_distance.unwrap_or(usize::MAX);
+    let b_hop = b.hop_distance.unwrap_or(usize::MAX);
+    a_hop
+        .cmp(&b_hop)
+        .then_with(|| compare_updated_at_desc(&a.row.updated_at, &b.row.updated_at))
+}
+
+fn compare_recency_then_hop(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    compare_updated_at_desc(&a.row.updated_at, &b.row.updated_at).then_with(|| {
+        let a_hop = a.hop_distance.unwrap_or(usize::MAX);
+        let b_hop = b.hop_distance.unwrap_or(usize::MAX);
+        a_hop.cmp(&b_hop)
+    })
+}
+
+fn compare_updated_at_desc(a: &str, b: &str) -> Ordering {
+    let a_dt = DateTime::parse_from_rfc3339(a)
+        .map(|v| v.timestamp())
+        .unwrap_or_default();
+    let b_dt = DateTime::parse_from_rfc3339(b)
+        .map(|v| v.timestamp())
+        .unwrap_or_default();
+    b_dt.cmp(&a_dt)
 }
 
 fn parse_json_or_raw(raw: &str) -> Value {

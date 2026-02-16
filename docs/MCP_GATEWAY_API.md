@@ -141,10 +141,19 @@ Request:
 ```json
 {
   "agent_id": "graph-agent",
-  "entity_canonical_name": "eyasu",
+  "seed_entities": ["eyasu"],
+  "max_hops": 2,
+  "rank_by": "hop_then_recency",
   "limit": 10
 }
 ```
+
+Request options:
+
+- `entity_canonical_name`: backward-compatible single seed.
+- `seed_entities`: one or more seed entities for neighborhood traversal.
+- `max_hops`: traversal depth (1-4, default `1`).
+- `rank_by`: `hop_then_recency` (default) or `recency`.
 
 Response:
 
@@ -160,7 +169,9 @@ Response:
       "predicate": "prefers",
       "object": { "entity_type": "language", "canonical_name": "rust" },
       "attributes_json": { "source": "manual" },
-      "redacted_fields": ["strength"]
+      "redacted_fields": ["strength"],
+      "hop_distance": 1,
+      "rank_score": 1780215619.0
     }
   ]
 }

@@ -121,6 +121,13 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - Verified audit listing behavior:
   - returns both `retrieve` and `graph_retrieve` events
   - exposes shared/redacted payload summaries for dashboard-style privacy inspection
+- Added graph traversal/ranking controls in MCP graph retrieval:
+  - request supports `seed_entities`, `max_hops`, `rank_by`
+  - response includes `hop_distance` and `rank_score`
+- Verified traversal behavior:
+  - `max_hops=1` returns direct neighborhood edges only
+  - `max_hops=2` expands to second-hop relationships
+  - `rank_by=hop_then_recency` and `rank_by=recency` produce different ordering
 
 ## Progress Tracker
 
@@ -135,6 +142,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema + versioned relationship compiler complete; graph-aware retrieval in MCP pending)
 - [~] Smart memory foundation implemented (graph schema + versioned relationship compiler + MCP graph retrieval complete; graph traversal/ranking improvements pending)
+- [~] Smart memory foundation implemented (graph traversal/ranking added; advanced multi-hop ranking heuristics still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
