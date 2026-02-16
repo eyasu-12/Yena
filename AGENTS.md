@@ -44,6 +44,43 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `services/mcp-gateway`
   - `services/policy-engine`
 - Validated SQLite migrations against a local test DB.
+- Implemented `ingest-service` v1 API scaffold:
+  - `GET /health`
+  - `POST /v1/evidence` with request validation
+  - SHA-256 checksum generation
+  - duplicate detection by `(source_type, source_ref, checksum)`
+  - SQLite-backed insert into immutable `evidence_records`
+- Added unique evidence idempotency index in migration `0002_indexes.sql`.
+- Added endpoint-level API contract in `docs/INGEST_API.md`.
+- Installed Rust toolchain (`rustup`, `cargo`, `rustc`).
+- Verified `ingest-service` build/tests and live API smoke behavior:
+  - `POST /v1/evidence` first insert returns `201`
+  - duplicate evidence returns `200` with `was_duplicate: true`
+- Implemented `memory-compiler` v1 API:
+  - `POST /v1/proposals`
+  - `POST /v1/proposals/{id}/commit`
+  - `POST /v1/proposals/{id}/reject`
+- Verified compiler live integration flow:
+  - commit creates active memory version
+  - second commit supersedes prior version
+  - reject transitions proposal to `rejected`
+- Added API contract doc `docs/MEMORY_COMPILER_API.md`.
+- Implemented `mcp-gateway` v1 API:
+  - `POST /v1/scopes/upsert`
+  - `POST /v1/policies/redact-keys`
+  - `POST /v1/connect`
+  - `POST /v1/retrieve`
+- Verified live MCP integration flow:
+  - agent scope limits retrieval by memory type
+  - redact policy removes configured keys from projected memory
+  - retrieval writes `retrieval_audit_events` with shared/redacted summaries
+- Added API contract doc `docs/MCP_GATEWAY_API.md`.
+- Saved external persistent-memory research notes for future core-memory iteration:
+  - `docs/PERSISTENT_MEMORY_RESEARCH.md`
+- Added MCP JSON-RPC endpoint in `mcp-gateway`:
+  - `POST /mcp` with `initialize`, `tools/list`, and `tools/call`
+  - tool mapping for `yena.connect`, `yena.retrieve`, `yena.scope.upsert`, `yena.policy.redact_keys`
+- Verified live JSON-RPC integration flow end-to-end across ingest/compiler/mcp services.
 
 ## Progress Tracker
 
@@ -52,9 +89,9 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Repository initialized and pushed to GitHub
 - [x] Core service scaffolded
 - [x] Schema and migrations implemented
-- [ ] Evidence ingestion v1 implemented
-- [ ] Memory compiler v1 implemented
-- [ ] MCP gateway v1 implemented
+- [x] Evidence ingestion v1 implemented
+- [x] Memory compiler v1 implemented
+- [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

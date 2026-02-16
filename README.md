@@ -9,6 +9,10 @@ Yena is a local-first memory control plane for agentic systems.
 - Work log and decisions: `AGENTS.md`
 - Architecture details: `docs/ARCHITECTURE.md`
 - Security assumptions: `docs/THREAT_MODEL.md`
+- Ingest API contract: `docs/INGEST_API.md`
+- Memory compiler API contract: `docs/MEMORY_COMPILER_API.md`
+- MCP gateway API contract: `docs/MCP_GATEWAY_API.md`
+- External memory research notes: `docs/PERSISTENT_MEMORY_RESEARCH.md`
 - DB schema migrations: `db/migrations/`
 
 ## Phase 0 Status
@@ -22,26 +26,29 @@ Yena is a local-first memory control plane for agentic systems.
 
 ## Next Commands
 
-1. Install Rust toolchain:
+1. Run tests:
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
+cargo test
 ```
 
-2. Install SQL migration tool (choose one):
+2. Run services (three terminals):
 
 ```bash
-cargo install sqlx-cli --no-default-features --features sqlite
+cargo run -p ingest-service
+cargo run -p memory-compiler
+cargo run -p mcp-gateway
 ```
 
-3. Build workspace:
+3. Exercise MCP JSON-RPC endpoint:
 
 ```bash
-cargo build
-```
-
-4. Start first implementation milestone:
-
-```bash
-# implement evidence append-only API in services/ingest-service
+curl -X POST http://127.0.0.1:8082/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"tools/list",
+    "params":{}
+  }'
 ```
