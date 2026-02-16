@@ -17,6 +17,7 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 - `ingest-service`: ingest and normalize events.
 - `evidence-store`: append-only evidence and provenance metadata.
 - `memory-compiler`: dedupe, supersede, canonicalize.
+- `graph-compiler`: entity/relationship memory with versioned edges.
 - `policy-engine`: evaluate source/category/agent scope rules.
 - `mcp-gateway`: retrieval and commit APIs.
 - `audit-log`: immutable access and redaction events.

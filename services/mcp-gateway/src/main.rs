@@ -274,30 +274,39 @@ async fn mcp_rpc(
 
 async fn execute_tool_call(state: AppState, id: Value, name: &str, args: Value) -> Value {
     let result = match name {
-        "yena.connect" => parse_and_execute::<ConnectRequest, ConnectResponse, _, _>(
-            state,
-            args,
-            |state, payload| async move { connect(State(state), Json(payload)).await },
-        )
-        .await,
-        "yena.retrieve" => parse_and_execute::<RetrieveRequest, RetrieveResponse, _, _>(
-            state,
-            args,
-            |state, payload| async move { retrieve(State(state), Json(payload)).await },
-        )
-        .await,
-        "yena.scope.upsert" => parse_and_execute::<UpsertScopeRequest, UpsertScopeResponse, _, _>(
-            state,
-            args,
-            |state, payload| async move { upsert_scope(State(state), Json(payload)).await },
-        )
-        .await,
-        "yena.policy.redact_keys" => {
-            parse_and_execute::<UpsertRedactPolicyRequest, PolicyResponse, _, _>(state, args, |state, payload| async move {
-                upsert_redact_policy(State(state), Json(payload)).await
-            })
+        "yena.connect" => {
+            parse_and_execute::<ConnectRequest, ConnectResponse, _, _>(
+                state,
+                args,
+                |state, payload| async move { connect(State(state), Json(payload)).await },
+            )
             .await
         }
+        "yena.retrieve" => {
+            parse_and_execute::<RetrieveRequest, RetrieveResponse, _, _>(
+                state,
+                args,
+                |state, payload| async move { retrieve(State(state), Json(payload)).await },
+            )
+            .await
+        }
+        "yena.scope.upsert" => {
+            parse_and_execute::<UpsertScopeRequest, UpsertScopeResponse, _, _>(
+                state,
+                args,
+                |state, payload| async move { upsert_scope(State(state), Json(payload)).await },
+            )
+            .await
+        }
+        "yena.policy.redact_keys" => parse_and_execute::<
+            UpsertRedactPolicyRequest,
+            PolicyResponse,
+            _,
+            _,
+        >(state, args, |state, payload| async move {
+            upsert_redact_policy(State(state), Json(payload)).await
+        })
+        .await,
         _ => Err(ApiError::bad_request(format!("unknown tool: {}", name))),
     };
 
@@ -604,8 +613,9 @@ async fn retrieve(
             }
         }
 
-        let value: Value = serde_json::from_str(&row.value_json)
-            .map_err(|e| ApiError::internal(format!("failed to decode memory value_json: {}", e)))?;
+        let value: Value = serde_json::from_str(&row.value_json).map_err(|e| {
+            ApiError::internal(format!("failed to decode memory value_json: {}", e))
+        })?;
         let (redacted_value, redacted_fields) = apply_redaction(value, &redaction_keys);
 
         projections.push(MemoryProjection {
@@ -707,7 +717,8 @@ fn load_redaction_keys(conn: &Connection) -> Result<BTreeSet<String>, ApiError> 
 
     let mut keys = BTreeSet::new();
     for row in rows {
-        let raw = row.map_err(|e| ApiError::internal(format!("failed to read policy row: {}", e)))?;
+        let raw =
+            row.map_err(|e| ApiError::internal(format!("failed to read policy row: {}", e)))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| ApiError::internal(format!("failed to decode policy json: {}", e)))?;
 
@@ -800,10 +811,14 @@ fn insert_retrieval_audit(
             } else {
                 scope_names.join(",")
             },
-            serde_json::to_string(shared_summary)
-                .map_err(|e| ApiError::internal(format!("failed to encode shared summary: {}", e)))?,
-            serde_json::to_string(redacted_summary)
-                .map_err(|e| ApiError::internal(format!("failed to encode redacted summary: {}", e)))?,
+            serde_json::to_string(shared_summary).map_err(|e| ApiError::internal(format!(
+                "failed to encode shared summary: {}",
+                e
+            )))?,
+            serde_json::to_string(redacted_summary).map_err(|e| ApiError::internal(format!(
+                "failed to encode redacted summary: {}",
+                e
+            )))?,
             Utc::now().to_rfc3339(),
         ],
     )
@@ -825,6 +840,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(include_str!("../../../db/migrations/0001_init.sql"))?;
     conn.execute_batch(include_str!("../../../db/migrations/0002_indexes.sql"))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0003_knowledge_graph.sql"
+    ))?;
     Ok(())
 }
 

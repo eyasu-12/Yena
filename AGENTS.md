@@ -96,6 +96,18 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - dry run reports matched stale memories without deletion
   - execute run deletes matching stale project memories while preserving non-matching memories
   - retention job status persisted in `retention_jobs`
+- Added knowledge graph foundation for smart memory:
+  - migration `db/migrations/0003_knowledge_graph.sql`
+  - graph entities + relationships + relationship versions + evidence links
+- Extended compiler graph APIs:
+  - `POST /v1/graph/proposals/relationships`
+  - `POST /v1/graph/proposals/{id}/commit`
+  - `GET /v1/graph/relationships/{id}`
+  - `GET /v1/graph/relationships/{id}/history`
+- Verified live graph behavior:
+  - graph proposal commit creates relationship version
+  - second commit supersedes first version
+  - history returns full temporal edge lifecycle with evidence links
 
 ## Progress Tracker
 
@@ -108,6 +120,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Memory compiler v1 implemented
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
+- [~] Smart memory foundation implemented (graph schema + versioned relationship compiler complete; graph-aware retrieval in MCP pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

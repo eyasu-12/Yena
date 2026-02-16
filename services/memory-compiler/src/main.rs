@@ -42,7 +42,9 @@ impl CreateProposalRequest {
             return Err(ApiError::bad_request("memory_type is required"));
         }
         if !(0.0..=1.0).contains(&self.confidence) {
-            return Err(ApiError::bad_request("confidence must be between 0.0 and 1.0"));
+            return Err(ApiError::bad_request(
+                "confidence must be between 0.0 and 1.0",
+            ));
         }
         if self.proposal_type.len() > 128 {
             return Err(ApiError::bad_request("proposal_type exceeds 128 chars"));
@@ -209,6 +211,136 @@ struct RetentionPolicyPayload {
     forget_evidence: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct GraphEntityRef {
+    entity_type: String,
+    canonical_name: String,
+}
+
+impl GraphEntityRef {
+    fn validate(&self, field_prefix: &str) -> Result<(), ApiError> {
+        if self.entity_type.trim().is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "{}.entity_type is required",
+                field_prefix
+            )));
+        }
+        if self.canonical_name.trim().is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "{}.canonical_name is required",
+                field_prefix
+            )));
+        }
+        if self.entity_type.len() > 128 {
+            return Err(ApiError::bad_request(format!(
+                "{}.entity_type exceeds 128 chars",
+                field_prefix
+            )));
+        }
+        if self.canonical_name.len() > 256 {
+            return Err(ApiError::bad_request(format!(
+                "{}.canonical_name exceeds 256 chars",
+                field_prefix
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateGraphRelationshipProposalRequest {
+    subject: GraphEntityRef,
+    predicate: String,
+    object: GraphEntityRef,
+    #[serde(default = "empty_json_object")]
+    attributes_json: Value,
+    #[serde(default)]
+    evidence_record_ids: Vec<String>,
+    confidence: f32,
+}
+
+impl CreateGraphRelationshipProposalRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        self.subject.validate("subject")?;
+        self.object.validate("object")?;
+        if self.predicate.trim().is_empty() {
+            return Err(ApiError::bad_request("predicate is required"));
+        }
+        if self.predicate.len() > 128 {
+            return Err(ApiError::bad_request("predicate exceeds 128 chars"));
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return Err(ApiError::bad_request(
+                "confidence must be between 0.0 and 1.0",
+            ));
+        }
+        if !self.attributes_json.is_object() {
+            return Err(ApiError::bad_request(
+                "attributes_json must be a JSON object",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GraphRelationshipProposalPayload {
+    subject: GraphEntityRef,
+    predicate: String,
+    object: GraphEntityRef,
+    attributes_json: Value,
+    evidence_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateGraphRelationshipProposalResponse {
+    proposal_id: String,
+    status: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CommitGraphProposalResponse {
+    proposal_id: String,
+    relationship_id: String,
+    version_id: String,
+    superseded_version_id: Option<String>,
+    committed_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphRelationshipViewResponse {
+    relationship_id: String,
+    subject: GraphEntityRef,
+    predicate: String,
+    object: GraphEntityRef,
+    active_version_id: String,
+    attributes_json: Value,
+    evidence_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphRelationshipHistoryResponse {
+    relationship_id: String,
+    subject: GraphEntityRef,
+    predicate: String,
+    object: GraphEntityRef,
+    versions: Vec<GraphRelationshipVersionEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphRelationshipVersionEntry {
+    version_id: String,
+    version_number: i64,
+    state: String,
+    attributes_json: Value,
+    supersedes_version_id: Option<String>,
+    valid_from: String,
+    valid_to: Option<String>,
+    created_at: String,
+    evidence_record_ids: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct DeleteCounts {
     deleted_versions: usize,
@@ -274,6 +406,7 @@ impl IntoResponse for ApiError {
 #[derive(Debug)]
 struct ProposalRow {
     id: String,
+    proposal_type: String,
     subject_key: String,
     payload_json: String,
     status: String,
@@ -304,9 +437,28 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/proposals/{id}/commit", post(commit_proposal))
         .route("/v1/proposals/{id}/reject", post(reject_proposal))
         .route("/v1/memory/{canonical_key}", get(get_memory))
-        .route("/v1/memory/{canonical_key}/history", get(get_memory_history))
+        .route(
+            "/v1/memory/{canonical_key}/history",
+            get(get_memory_history),
+        )
         .route("/v1/memory/forget", post(forget_memory))
-        .route("/v1/retention/policies/upsert", post(upsert_retention_policy))
+        .route(
+            "/v1/graph/proposals/relationships",
+            post(create_graph_relationship_proposal),
+        )
+        .route(
+            "/v1/graph/proposals/{id}/commit",
+            post(commit_graph_relationship_proposal),
+        )
+        .route("/v1/graph/relationships/{id}", get(get_graph_relationship))
+        .route(
+            "/v1/graph/relationships/{id}/history",
+            get(get_graph_relationship_history),
+        )
+        .route(
+            "/v1/retention/policies/upsert",
+            post(upsert_retention_policy),
+        )
         .route("/v1/retention/jobs/run", post(run_retention_jobs))
         .with_state(state);
 
@@ -376,6 +528,11 @@ async fn commit_proposal(
         .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
 
     let proposal = load_proposal(&tx, &id)?;
+    if proposal.proposal_type == "graph_relationship" {
+        return Err(ApiError::bad_request(
+            "graph_relationship proposals must be committed via /v1/graph/proposals/{id}/commit",
+        ));
+    }
     if proposal.status != "pending" {
         return Err(ApiError::conflict(format!(
             "proposal {} has status '{}' and cannot be committed",
@@ -391,7 +548,12 @@ async fn commit_proposal(
     }
 
     let committed_at = Utc::now().to_rfc3339();
-    let (memory_item_id, old_active_version_id) = ensure_memory_item(&tx, &payload.memory_type, &proposal.subject_key, &committed_at)?;
+    let (memory_item_id, old_active_version_id) = ensure_memory_item(
+        &tx,
+        &payload.memory_type,
+        &proposal.subject_key,
+        &committed_at,
+    )?;
 
     let version_number = next_version_number(&tx, &memory_item_id)?;
     let new_version_id = Uuid::new_v4().to_string();
@@ -514,6 +676,395 @@ async fn reject_proposal(
         proposal_id: id,
         status: "rejected".to_string(),
         resolved_at,
+    }))
+}
+
+async fn create_graph_relationship_proposal(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateGraphRelationshipProposalRequest>,
+) -> Result<(StatusCode, Json<CreateGraphRelationshipProposalResponse>), ApiError> {
+    payload.validate()?;
+
+    let created_at = Utc::now().to_rfc3339();
+    let proposal_id = Uuid::new_v4().to_string();
+    let subject_key = format!(
+        "{}|{}|{}",
+        normalize_token(&payload.subject.canonical_name),
+        normalize_token(&payload.predicate),
+        normalize_token(&payload.object.canonical_name)
+    );
+
+    let proposal_payload = GraphRelationshipProposalPayload {
+        subject: payload.subject,
+        predicate: payload.predicate,
+        object: payload.object,
+        attributes_json: payload.attributes_json,
+        evidence_record_ids: payload.evidence_record_ids,
+    };
+
+    let payload_json = serde_json::to_string(&proposal_payload).map_err(|e| {
+        ApiError::internal(format!("failed to encode graph proposal payload: {}", e))
+    })?;
+
+    let conn = open_db(&state.db_path)?;
+    conn.execute(
+        "
+        INSERT INTO memory_proposals (
+          id, proposal_type, subject_key, payload_json, confidence, status, created_at, resolved_at
+        ) VALUES (?1, 'graph_relationship', ?2, ?3, ?4, 'pending', ?5, NULL)
+        ",
+        params![
+            &proposal_id,
+            &subject_key,
+            &payload_json,
+            payload.confidence,
+            &created_at
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert graph proposal: {}", e)))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateGraphRelationshipProposalResponse {
+            proposal_id,
+            status: "pending".to_string(),
+            created_at,
+        }),
+    ))
+}
+
+async fn commit_graph_relationship_proposal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CommitGraphProposalResponse>, ApiError> {
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+    let proposal = load_proposal(&tx, &id)?;
+    if proposal.proposal_type != "graph_relationship" {
+        return Err(ApiError::bad_request(format!(
+            "proposal {} is type '{}' not graph_relationship",
+            id, proposal.proposal_type
+        )));
+    }
+    if proposal.status != "pending" {
+        return Err(ApiError::conflict(format!(
+            "proposal {} has status '{}' and cannot be committed",
+            id, proposal.status
+        )));
+    }
+
+    let payload: GraphRelationshipProposalPayload = serde_json::from_str(&proposal.payload_json)
+        .map_err(|e| ApiError::internal(format!("failed to decode graph payload: {}", e)))?;
+
+    for evidence_id in &payload.evidence_record_ids {
+        ensure_evidence_exists(&tx, evidence_id)?;
+    }
+
+    let committed_at = Utc::now().to_rfc3339();
+    let subject_entity_id = ensure_graph_entity(&tx, &payload.subject, &committed_at)?;
+    let object_entity_id = ensure_graph_entity(&tx, &payload.object, &committed_at)?;
+
+    let canonical_key = format!(
+        "{}|{}|{}",
+        normalize_token(&payload.subject.canonical_name),
+        normalize_token(&payload.predicate),
+        normalize_token(&payload.object.canonical_name)
+    );
+
+    let (relationship_id, old_active_version_id) = ensure_graph_relationship(
+        &tx,
+        &canonical_key,
+        &subject_entity_id,
+        &payload.predicate,
+        &object_entity_id,
+        &committed_at,
+    )?;
+
+    let new_version_id = Uuid::new_v4().to_string();
+    let version_number = next_graph_relationship_version_number(&tx, &relationship_id)?;
+
+    if let Some(old_version_id) = &old_active_version_id {
+        tx.execute(
+            "
+            UPDATE graph_relationship_versions
+            SET state = 'superseded', valid_to = ?2
+            WHERE id = ?1
+            ",
+            params![old_version_id, &committed_at],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to supersede graph version: {}", e)))?;
+    }
+
+    tx.execute(
+        "
+        INSERT INTO graph_relationship_versions (
+          id, relationship_id, version_number, state, attributes_json,
+          supersedes_version_id, valid_from, valid_to, created_at
+        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, NULL, ?6)
+        ",
+        params![
+            &new_version_id,
+            &relationship_id,
+            version_number,
+            serde_json::to_string(&payload.attributes_json).map_err(|e| ApiError::internal(
+                format!("failed to encode attributes_json: {}", e)
+            ))?,
+            &old_active_version_id,
+            &committed_at,
+        ],
+    )
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "failed to insert graph relationship version: {}",
+            e
+        ))
+    })?;
+
+    for evidence_id in &payload.evidence_record_ids {
+        tx.execute(
+            "
+            INSERT INTO graph_relationship_evidence_links (
+              id, relationship_version_id, evidence_record_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                &new_version_id,
+                evidence_id,
+                &committed_at,
+            ],
+        )
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to insert relationship evidence link: {}",
+                e
+            ))
+        })?;
+    }
+
+    tx.execute(
+        "
+        UPDATE graph_relationships
+        SET active_version_id = ?2, status = 'active', updated_at = ?3
+        WHERE id = ?1
+        ",
+        params![&relationship_id, &new_version_id, &committed_at],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update graph relationship: {}", e)))?;
+
+    tx.execute(
+        "
+        UPDATE memory_proposals
+        SET status = 'committed', resolved_at = ?2
+        WHERE id = ?1
+        ",
+        params![&proposal.id, &committed_at],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update graph proposal status: {}", e)))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(CommitGraphProposalResponse {
+        proposal_id: id,
+        relationship_id,
+        version_id: new_version_id,
+        superseded_version_id: old_active_version_id,
+        committed_at,
+    }))
+}
+
+async fn get_graph_relationship(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<GraphRelationshipViewResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = conn
+        .query_row(
+            "
+            SELECT
+              gr.id,
+              se.entity_type,
+              se.canonical_name,
+              gr.predicate,
+              oe.entity_type,
+              oe.canonical_name,
+              grv.id,
+              grv.attributes_json,
+              grv.created_at
+            FROM graph_relationships gr
+            JOIN graph_entities se ON se.id = gr.subject_entity_id
+            JOIN graph_entities oe ON oe.id = gr.object_entity_id
+            JOIN graph_relationship_versions grv ON grv.id = gr.active_version_id
+            WHERE gr.id = ?1
+            LIMIT 1
+            ",
+            params![&id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup graph relationship: {}", e)))?;
+
+    let (
+        relationship_id,
+        subject_entity_type,
+        subject_canonical_name,
+        predicate,
+        object_entity_type,
+        object_canonical_name,
+        active_version_id,
+        attributes_raw,
+        _created_at,
+    ) = row.ok_or_else(|| ApiError::not_found("graph relationship not found"))?;
+
+    let attributes_json: Value = serde_json::from_str(&attributes_raw)
+        .map_err(|e| ApiError::internal(format!("failed to decode attributes_json: {}", e)))?;
+    let evidence_record_ids =
+        load_evidence_for_graph_relationship_version(&conn, &active_version_id)?;
+
+    Ok(Json(GraphRelationshipViewResponse {
+        relationship_id,
+        subject: GraphEntityRef {
+            entity_type: subject_entity_type,
+            canonical_name: subject_canonical_name,
+        },
+        predicate,
+        object: GraphEntityRef {
+            entity_type: object_entity_type,
+            canonical_name: object_canonical_name,
+        },
+        active_version_id,
+        attributes_json,
+        evidence_record_ids,
+    }))
+}
+
+async fn get_graph_relationship_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<GraphRelationshipHistoryResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+
+    let relationship_row: Option<(String, String, String, String, String, String)> = conn
+        .query_row(
+            "
+            SELECT gr.id, se.entity_type, se.canonical_name, gr.predicate, oe.entity_type, oe.canonical_name
+            FROM graph_relationships gr
+            JOIN graph_entities se ON se.id = gr.subject_entity_id
+            JOIN graph_entities oe ON oe.id = gr.object_entity_id
+            WHERE gr.id = ?1
+            LIMIT 1
+            ",
+            params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup graph relationship: {}", e)))?;
+
+    let (
+        relationship_id,
+        subject_entity_type,
+        subject_canonical_name,
+        predicate,
+        object_entity_type,
+        object_canonical_name,
+    ) = relationship_row.ok_or_else(|| ApiError::not_found("graph relationship not found"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, version_number, state, attributes_json, supersedes_version_id, valid_from, valid_to, created_at
+            FROM graph_relationship_versions
+            WHERE relationship_id = ?1
+            ORDER BY version_number DESC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare graph history query: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![&relationship_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute graph history query: {}", e)))?;
+
+    let mut versions = Vec::new();
+    for row in rows {
+        let (
+            version_id,
+            version_number,
+            state,
+            attributes_raw,
+            supersedes_version_id,
+            valid_from,
+            valid_to,
+            created_at,
+        ) = row
+            .map_err(|e| ApiError::internal(format!("failed to read graph history row: {}", e)))?;
+
+        let attributes_json: Value = serde_json::from_str(&attributes_raw)
+            .map_err(|e| ApiError::internal(format!("failed to decode attributes_json: {}", e)))?;
+        let evidence_record_ids = load_evidence_for_graph_relationship_version(&conn, &version_id)?;
+
+        versions.push(GraphRelationshipVersionEntry {
+            version_id,
+            version_number,
+            state,
+            attributes_json,
+            supersedes_version_id,
+            valid_from,
+            valid_to,
+            created_at,
+            evidence_record_ids,
+        });
+    }
+
+    Ok(Json(GraphRelationshipHistoryResponse {
+        relationship_id,
+        subject: GraphEntityRef {
+            entity_type: subject_entity_type,
+            canonical_name: subject_canonical_name,
+        },
+        predicate,
+        object: GraphEntityRef {
+            entity_type: object_entity_type,
+            canonical_name: object_canonical_name,
+        },
+        versions,
     }))
 }
 
@@ -670,7 +1221,8 @@ async fn forget_memory(
         .optional()
         .map_err(|e| ApiError::internal(format!("failed to lookup memory item: {}", e)))?;
 
-    let memory_item_id = memory_item_id.ok_or_else(|| ApiError::not_found("memory item not found"))?;
+    let memory_item_id =
+        memory_item_id.ok_or_else(|| ApiError::not_found("memory item not found"))?;
     let counts = delete_memory_item_by_id_tx(&tx, &memory_item_id, payload.forget_evidence)?;
 
     tx.commit()
@@ -709,8 +1261,11 @@ async fn upsert_retention_policy(
         .transaction()
         .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
 
-    tx.execute("DELETE FROM policy_rules WHERE rule_name = ?1", params![&rule_name])
-        .map_err(|e| ApiError::internal(format!("failed to delete existing policy: {}", e)))?;
+    tx.execute(
+        "DELETE FROM policy_rules WHERE rule_name = ?1",
+        params![&rule_name],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to delete existing policy: {}", e)))?;
 
     tx.execute(
         "
@@ -823,7 +1378,7 @@ fn open_db(db_path: &str) -> Result<Connection, ApiError> {
 fn load_proposal(conn: &Connection, id: &str) -> Result<ProposalRow, ApiError> {
     conn.query_row(
         "
-        SELECT id, subject_key, payload_json, status
+        SELECT id, proposal_type, subject_key, payload_json, status
         FROM memory_proposals
         WHERE id = ?1
         ",
@@ -831,9 +1386,10 @@ fn load_proposal(conn: &Connection, id: &str) -> Result<ProposalRow, ApiError> {
         |row| {
             Ok(ProposalRow {
                 id: row.get(0)?,
-                subject_key: row.get(1)?,
-                payload_json: row.get(2)?,
-                status: row.get(3)?,
+                proposal_type: row.get(1)?,
+                subject_key: row.get(2)?,
+                payload_json: row.get(3)?,
+                status: row.get(4)?,
             })
         },
     )
@@ -935,7 +1491,10 @@ fn load_evidence_for_version(conn: &Connection, version_id: &str) -> Result<Vec<
     collected.map_err(|e| ApiError::internal(format!("failed to read evidence rows: {}", e)))
 }
 
-fn load_version_ids_for_item(conn: &Connection, memory_item_id: &str) -> Result<Vec<String>, ApiError> {
+fn load_version_ids_for_item(
+    conn: &Connection,
+    memory_item_id: &str,
+) -> Result<Vec<String>, ApiError> {
     let mut stmt = conn
         .prepare(
             "
@@ -967,6 +1526,139 @@ fn load_evidence_ids_for_versions(
     Ok(evidence_ids)
 }
 
+fn ensure_graph_entity(
+    conn: &Connection,
+    entity: &GraphEntityRef,
+    now: &str,
+) -> Result<String, ApiError> {
+    let entity_type = normalize_token(&entity.entity_type);
+    let canonical_name = normalize_token(&entity.canonical_name);
+
+    let existing: Option<String> = conn
+        .query_row(
+            "
+            SELECT id
+            FROM graph_entities
+            WHERE entity_type = ?1 AND canonical_name = ?2
+            LIMIT 1
+            ",
+            params![&entity_type, &canonical_name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup graph entity: {}", e)))?;
+
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "
+        INSERT INTO graph_entities (
+          id, entity_type, canonical_name, attributes_json, status, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, '{}', 'active', ?4, ?4)
+        ",
+        params![&id, &entity_type, &canonical_name, now],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert graph entity: {}", e)))?;
+
+    Ok(id)
+}
+
+fn ensure_graph_relationship(
+    conn: &Connection,
+    canonical_key: &str,
+    subject_entity_id: &str,
+    predicate: &str,
+    object_entity_id: &str,
+    now: &str,
+) -> Result<(String, Option<String>), ApiError> {
+    let existing: Option<(String, Option<String>)> = conn
+        .query_row(
+            "
+            SELECT id, active_version_id
+            FROM graph_relationships
+            WHERE canonical_key = ?1
+            LIMIT 1
+            ",
+            params![canonical_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup graph relationship: {}", e)))?;
+
+    if let Some(v) = existing {
+        return Ok(v);
+    }
+
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "
+        INSERT INTO graph_relationships (
+          id, canonical_key, subject_entity_id, predicate, object_entity_id,
+          active_version_id, status, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'active', ?6, ?6)
+        ",
+        params![
+            &id,
+            canonical_key,
+            subject_entity_id,
+            normalize_token(predicate),
+            object_entity_id,
+            now,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert graph relationship: {}", e)))?;
+
+    Ok((id, None))
+}
+
+fn next_graph_relationship_version_number(
+    conn: &Connection,
+    relationship_id: &str,
+) -> Result<i64, ApiError> {
+    let next: i64 = conn
+        .query_row(
+            "
+            SELECT COALESCE(MAX(version_number), 0) + 1
+            FROM graph_relationship_versions
+            WHERE relationship_id = ?1
+            ",
+            params![relationship_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| ApiError::internal(format!("failed graph version number query: {}", e)))?;
+    Ok(next)
+}
+
+fn load_evidence_for_graph_relationship_version(
+    conn: &Connection,
+    version_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT evidence_record_id
+            FROM graph_relationship_evidence_links
+            WHERE relationship_version_id = ?1
+            ORDER BY created_at ASC
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to prepare graph evidence query: {}", e))
+        })?;
+
+    let rows = stmt
+        .query_map(params![version_id], |r| r.get::<_, String>(0))
+        .map_err(|e| {
+            ApiError::internal(format!("failed to execute graph evidence query: {}", e))
+        })?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    collected.map_err(|e| ApiError::internal(format!("failed to read graph evidence rows: {}", e)))
+}
+
 fn delete_memory_item_by_id_tx(
     conn: &Connection,
     memory_item_id: &str,
@@ -995,7 +1687,10 @@ fn delete_memory_item_by_id_tx(
         .map_err(|e| ApiError::internal(format!("failed to delete memory versions: {}", e)))?;
 
     let deleted_items = conn
-        .execute("DELETE FROM memory_items WHERE id = ?1", params![memory_item_id])
+        .execute(
+            "DELETE FROM memory_items WHERE id = ?1",
+            params![memory_item_id],
+        )
         .map_err(|e| ApiError::internal(format!("failed to delete memory item: {}", e)))?;
 
     if deleted_items == 0 {
@@ -1017,7 +1712,9 @@ fn delete_memory_item_by_id_tx(
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(|e| ApiError::internal(format!("failed evidence linkage lookup: {}", e)))?;
+                .map_err(|e| {
+                    ApiError::internal(format!("failed evidence linkage lookup: {}", e))
+                })?;
 
             if still_linked.is_none() {
                 deleted_evidence += conn
@@ -1025,7 +1722,9 @@ fn delete_memory_item_by_id_tx(
                         "DELETE FROM evidence_records WHERE id = ?1",
                         params![&evidence_id],
                     )
-                    .map_err(|e| ApiError::internal(format!("failed to delete evidence record: {}", e)))?;
+                    .map_err(|e| {
+                        ApiError::internal(format!("failed to delete evidence record: {}", e))
+                    })?;
             }
         }
     }
@@ -1178,6 +1877,14 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn normalize_token(input: &str) -> String {
+    input.trim().to_lowercase()
+}
+
+fn empty_json_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1195,6 +1902,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(include_str!("../../../db/migrations/0001_init.sql"))?;
     conn.execute_batch(include_str!("../../../db/migrations/0002_indexes.sql"))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0003_knowledge_graph.sql"
+    ))?;
     Ok(())
 }
 

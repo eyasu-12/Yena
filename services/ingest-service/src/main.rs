@@ -159,13 +159,8 @@ async fn create_evidence(
     let conn = Connection::open(&state.db_path)
         .map_err(|e| ApiError::internal(format!("failed to open db: {}", e)))?;
 
-    let duplicate = find_duplicate(
-        &conn,
-        &payload.source_type,
-        &payload.source_ref,
-        &checksum,
-    )
-    .map_err(|e| ApiError::internal(format!("failed duplicate lookup: {}", e)))?;
+    let duplicate = find_duplicate(&conn, &payload.source_type, &payload.source_ref, &checksum)
+        .map_err(|e| ApiError::internal(format!("failed duplicate lookup: {}", e)))?;
 
     if let Some((id, ingested_at_existing)) = duplicate {
         return Ok((
@@ -251,6 +246,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(include_str!("../../../db/migrations/0001_init.sql"))?;
     conn.execute_batch(include_str!("../../../db/migrations/0002_indexes.sql"))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0003_knowledge_graph.sql"
+    ))?;
     Ok(())
 }
 

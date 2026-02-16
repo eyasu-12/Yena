@@ -211,6 +211,95 @@ Response `200`:
 }
 ```
 
+## POST /v1/graph/proposals/relationships
+
+Creates a pending graph relationship proposal.
+
+Request:
+
+```json
+{
+  "subject": { "entity_type": "person", "canonical_name": "Eyasu" },
+  "predicate": "prefers",
+  "object": { "entity_type": "language", "canonical_name": "Rust" },
+  "attributes_json": { "strength": "high" },
+  "evidence_record_ids": ["uuid"],
+  "confidence": 0.93
+}
+```
+
+Response `201`:
+
+```json
+{
+  "proposal_id": "uuid",
+  "status": "pending",
+  "created_at": "2026-02-16T02:42:37+00:00"
+}
+```
+
+## POST /v1/graph/proposals/{id}/commit
+
+Commits a graph relationship proposal into versioned graph state.
+
+Response `200`:
+
+```json
+{
+  "proposal_id": "uuid",
+  "relationship_id": "uuid",
+  "version_id": "uuid",
+  "superseded_version_id": "uuid-or-null",
+  "committed_at": "2026-02-16T02:42:37+00:00"
+}
+```
+
+## GET /v1/graph/relationships/{id}
+
+Returns active relationship projection.
+
+Response `200`:
+
+```json
+{
+  "relationship_id": "uuid",
+  "subject": { "entity_type": "person", "canonical_name": "eyasu" },
+  "predicate": "prefers",
+  "object": { "entity_type": "language", "canonical_name": "rust" },
+  "active_version_id": "uuid",
+  "attributes_json": { "strength": "very_high" },
+  "evidence_record_ids": ["uuid"]
+}
+```
+
+## GET /v1/graph/relationships/{id}/history
+
+Returns relationship version history (active + superseded).
+
+Response `200`:
+
+```json
+{
+  "relationship_id": "uuid",
+  "subject": { "entity_type": "person", "canonical_name": "eyasu" },
+  "predicate": "prefers",
+  "object": { "entity_type": "language", "canonical_name": "rust" },
+  "versions": [
+    {
+      "version_id": "uuid",
+      "version_number": 2,
+      "state": "active",
+      "attributes_json": { "strength": "very_high" },
+      "supersedes_version_id": "uuid",
+      "valid_from": "2026-02-16T02:42:37+00:00",
+      "valid_to": null,
+      "created_at": "2026-02-16T02:42:37+00:00",
+      "evidence_record_ids": ["uuid"]
+    }
+  ]
+}
+```
+
 ## Error Patterns
 
 - `400`: invalid request fields or missing evidence IDs.
