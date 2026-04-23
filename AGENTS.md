@@ -34,6 +34,30 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `rank_by=hop_then_recency` still returns the newer same-hop edge first
   - semantic filters (`predicates`, `entity_types`, `min_confidence`) narrow retrieval as expected
 - Verified updated workspace with `cargo fmt` and `cargo test`.
+- Added graph canonicalization/compaction foundation:
+  - `db/migrations/0005_graph_canonicalization.sql`
+  - `graph_entity_aliases`
+  - `graph_predicate_aliases`
+  - `graph_relationship_redirects`
+  - `graph_compaction_jobs`
+- Extended compiler graph APIs:
+  - `POST /v1/graph/canonicalization/entity-aliases/upsert`
+  - `POST /v1/graph/canonicalization/predicate-aliases/upsert`
+  - `POST /v1/graph/compaction/run`
+- Extended graph commit behavior:
+  - future graph proposals resolve entity aliases and predicate aliases before commit
+  - canonical graph commits now stop fresh duplicate edges from being created once alias rules exist
+- Added graph compaction behavior:
+  - dry-run summary for planned canonicalization/redirect/merge work
+  - active duplicate relationships collapse onto one canonical active relationship
+  - surviving relationship receives a merged active version with max confidence and unioned evidence
+  - redirected relationships are tracked in `graph_relationship_redirects`
+  - orphaned alias entities are marked `compacted`
+- Verified live graph compaction behavior:
+  - future alias-based proposals now commit directly into canonical graph state
+  - pre-existing alias relationships compact into one canonical active relationship
+  - compaction reports canonicalized, redirected, merged, and compacted counts correctly
+  - MCP graph retrieval returns only the canonical active relationship after compaction
 
 ### 2026-02-16
 
@@ -160,7 +184,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Memory compiler v1 implemented
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
-- [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, and ranking heuristics complete; broader reasoning and graph compaction still pending)
+- [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, ranking heuristics, canonicalization rules, and compaction complete; broader reasoning and graph semantics still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released

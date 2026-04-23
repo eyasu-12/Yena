@@ -244,6 +244,7 @@ Commits a graph relationship proposal into versioned graph state.
 
 Behavior:
 
+- Resolves entity aliases and predicate aliases before writing canonical graph state.
 - Carries proposal confidence into the committed relationship version.
 - Supersedes the previous active relationship version when present.
 
@@ -256,6 +257,92 @@ Response `200`:
   "version_id": "uuid",
   "superseded_version_id": "uuid-or-null",
   "committed_at": "2026-02-16T02:42:37+00:00"
+}
+```
+
+## POST /v1/graph/canonicalization/entity-aliases/upsert
+
+Create/update an entity alias rule used by future graph commits and compaction.
+
+Request:
+
+```json
+{
+  "entity_type": "language",
+  "alias_name": "rustlang",
+  "canonical_name": "rust"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "entity_type": "language",
+  "alias_name": "rustlang",
+  "canonical_entity_id": "uuid",
+  "canonical_name": "rust",
+  "updated_at": "2026-04-23T19:33:39+00:00"
+}
+```
+
+## POST /v1/graph/canonicalization/predicate-aliases/upsert
+
+Create/update a predicate alias rule used by future graph commits and compaction.
+
+Request:
+
+```json
+{
+  "alias_predicate": "likes",
+  "canonical_predicate": "prefers"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "alias_predicate": "likes",
+  "canonical_predicate": "prefers",
+  "updated_at": "2026-04-23T19:33:39+00:00"
+}
+```
+
+## POST /v1/graph/compaction/run
+
+Run graph compaction against existing active relationships using the configured alias rules.
+
+Behavior:
+
+- `dry_run: true` reports the work that would happen without mutating graph state.
+- Canonicalizes subject/object entity references and predicates.
+- Redirects duplicate active relationships onto a single canonical active relationship.
+- Creates a merged active version on the surviving relationship with max confidence and unioned evidence.
+- Marks now-orphaned alias entities as `compacted`.
+
+Request:
+
+```json
+{
+  "dry_run": false
+}
+```
+
+Response `200`:
+
+```json
+{
+  "job_id": "uuid",
+  "dry_run": false,
+  "status": "completed",
+  "run_at": "2026-04-23T19:35:00+00:00",
+  "entity_alias_rules": 1,
+  "predicate_alias_rules": 1,
+  "canonicalized_relationships": 1,
+  "redirected_relationships": 1,
+  "merged_versions_created": 1,
+  "compacted_entities": 1
 }
 ```
 

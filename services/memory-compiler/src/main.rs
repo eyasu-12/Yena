@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, env, net::SocketAddr};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::SocketAddr,
+};
 
 use axum::{
     extract::{Path, State},
@@ -10,7 +15,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tracing::info;
 use uuid::Uuid;
 
@@ -283,6 +288,99 @@ impl CreateGraphRelationshipProposalRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct UpsertGraphEntityAliasRequest {
+    entity_type: String,
+    alias_name: String,
+    canonical_name: String,
+}
+
+impl UpsertGraphEntityAliasRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.entity_type.trim().is_empty() {
+            return Err(ApiError::bad_request("entity_type is required"));
+        }
+        if self.alias_name.trim().is_empty() {
+            return Err(ApiError::bad_request("alias_name is required"));
+        }
+        if self.canonical_name.trim().is_empty() {
+            return Err(ApiError::bad_request("canonical_name is required"));
+        }
+        if self.entity_type.len() > 128 {
+            return Err(ApiError::bad_request("entity_type exceeds 128 chars"));
+        }
+        if self.alias_name.len() > 256 {
+            return Err(ApiError::bad_request("alias_name exceeds 256 chars"));
+        }
+        if self.canonical_name.len() > 256 {
+            return Err(ApiError::bad_request("canonical_name exceeds 256 chars"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpsertGraphEntityAliasResponse {
+    entity_type: String,
+    alias_name: String,
+    canonical_entity_id: String,
+    canonical_name: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertGraphPredicateAliasRequest {
+    alias_predicate: String,
+    canonical_predicate: String,
+}
+
+impl UpsertGraphPredicateAliasRequest {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.alias_predicate.trim().is_empty() {
+            return Err(ApiError::bad_request("alias_predicate is required"));
+        }
+        if self.canonical_predicate.trim().is_empty() {
+            return Err(ApiError::bad_request("canonical_predicate is required"));
+        }
+        if self.alias_predicate.len() > 128 {
+            return Err(ApiError::bad_request("alias_predicate exceeds 128 chars"));
+        }
+        if self.canonical_predicate.len() > 128 {
+            return Err(ApiError::bad_request(
+                "canonical_predicate exceeds 128 chars",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpsertGraphPredicateAliasResponse {
+    alias_predicate: String,
+    canonical_predicate: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunGraphCompactionRequest {
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RunGraphCompactionResponse {
+    job_id: String,
+    dry_run: bool,
+    status: String,
+    run_at: String,
+    entity_alias_rules: usize,
+    predicate_alias_rules: usize,
+    canonicalized_relationships: usize,
+    redirected_relationships: usize,
+    merged_versions_created: usize,
+    compacted_entities: usize,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct GraphRelationshipProposalPayload {
     subject: GraphEntityRef,
@@ -341,6 +439,42 @@ struct GraphRelationshipVersionEntry {
     valid_to: Option<String>,
     created_at: String,
     evidence_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GraphCompactionCandidate {
+    relationship_id: String,
+    canonical_key: String,
+    subject_entity_id: String,
+    subject_entity_type: String,
+    subject_canonical_name: String,
+    predicate: String,
+    object_entity_id: String,
+    object_entity_type: String,
+    object_canonical_name: String,
+    active_version_id: String,
+    active_confidence: f32,
+    active_attributes_json: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct GraphCompactionPlanEntry {
+    candidate: GraphCompactionCandidate,
+    target_subject_entity_id: String,
+    target_subject_canonical_name: String,
+    target_object_entity_id: String,
+    target_object_canonical_name: String,
+    target_predicate: String,
+    target_canonical_key: String,
+}
+
+#[derive(Debug, Default)]
+struct GraphCompactionCounts {
+    canonicalized_relationships: usize,
+    redirected_relationships: usize,
+    merged_versions_created: usize,
+    compacted_entities: usize,
 }
 
 #[derive(Debug, Default)]
@@ -453,6 +587,15 @@ async fn main() -> anyhow::Result<()> {
             "/v1/graph/proposals/{id}/commit",
             post(commit_graph_relationship_proposal),
         )
+        .route(
+            "/v1/graph/canonicalization/entity-aliases/upsert",
+            post(upsert_graph_entity_alias),
+        )
+        .route(
+            "/v1/graph/canonicalization/predicate-aliases/upsert",
+            post(upsert_graph_predicate_alias),
+        )
+        .route("/v1/graph/compaction/run", post(run_graph_compaction))
         .route("/v1/graph/relationships/{id}", get(get_graph_relationship))
         .route(
             "/v1/graph/relationships/{id}/history",
@@ -690,11 +833,21 @@ async fn create_graph_relationship_proposal(
 
     let created_at = Utc::now().to_rfc3339();
     let proposal_id = Uuid::new_v4().to_string();
+    let conn = open_db(&state.db_path)?;
+    let canonical_subject_name = canonicalize_graph_entity_name_for_key(
+        &conn,
+        &payload.subject.entity_type,
+        &payload.subject.canonical_name,
+    )?;
+    let canonical_predicate = canonicalize_graph_predicate(&conn, &payload.predicate)?;
+    let canonical_object_name = canonicalize_graph_entity_name_for_key(
+        &conn,
+        &payload.object.entity_type,
+        &payload.object.canonical_name,
+    )?;
     let subject_key = format!(
         "{}|{}|{}",
-        normalize_token(&payload.subject.canonical_name),
-        normalize_token(&payload.predicate),
-        normalize_token(&payload.object.canonical_name)
+        canonical_subject_name, canonical_predicate, canonical_object_name
     );
 
     let proposal_payload = GraphRelationshipProposalPayload {
@@ -709,7 +862,6 @@ async fn create_graph_relationship_proposal(
         ApiError::internal(format!("failed to encode graph proposal payload: {}", e))
     })?;
 
-    let conn = open_db(&state.db_path)?;
     conn.execute(
         "
         INSERT INTO memory_proposals (
@@ -734,6 +886,206 @@ async fn create_graph_relationship_proposal(
             created_at,
         }),
     ))
+}
+
+async fn upsert_graph_entity_alias(
+    State(state): State<AppState>,
+    Json(payload): Json<UpsertGraphEntityAliasRequest>,
+) -> Result<Json<UpsertGraphEntityAliasResponse>, ApiError> {
+    payload.validate()?;
+
+    let updated_at = Utc::now().to_rfc3339();
+    let entity_type = normalize_token(&payload.entity_type);
+    let alias_name = normalize_token(&payload.alias_name);
+    let canonical_name = normalize_token(&payload.canonical_name);
+
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+    let canonical_entity_id =
+        ensure_graph_entity_without_alias(&tx, &entity_type, &canonical_name, &updated_at)?;
+
+    let existing_id: Option<String> = tx
+        .query_row(
+            "
+            SELECT id
+            FROM graph_entity_aliases
+            WHERE entity_type = ?1 AND alias_name = ?2
+            LIMIT 1
+            ",
+            params![&entity_type, &alias_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup entity alias: {}", e)))?;
+
+    if let Some(existing_id) = existing_id {
+        tx.execute(
+            "
+            UPDATE graph_entity_aliases
+            SET canonical_entity_id = ?2, updated_at = ?3
+            WHERE id = ?1
+            ",
+            params![&existing_id, &canonical_entity_id, &updated_at],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to update entity alias: {}", e)))?;
+    } else {
+        tx.execute(
+            "
+            INSERT INTO graph_entity_aliases (
+              id, entity_type, alias_name, canonical_entity_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                &entity_type,
+                &alias_name,
+                &canonical_entity_id,
+                &updated_at,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to insert entity alias: {}", e)))?;
+    }
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(UpsertGraphEntityAliasResponse {
+        entity_type,
+        alias_name,
+        canonical_entity_id,
+        canonical_name,
+        updated_at,
+    }))
+}
+
+async fn upsert_graph_predicate_alias(
+    State(state): State<AppState>,
+    Json(payload): Json<UpsertGraphPredicateAliasRequest>,
+) -> Result<Json<UpsertGraphPredicateAliasResponse>, ApiError> {
+    payload.validate()?;
+
+    let updated_at = Utc::now().to_rfc3339();
+    let alias_predicate = normalize_token(&payload.alias_predicate);
+    let canonical_predicate = normalize_token(&payload.canonical_predicate);
+    let conn = open_db(&state.db_path)?;
+
+    let existing_id: Option<String> = conn
+        .query_row(
+            "
+            SELECT id
+            FROM graph_predicate_aliases
+            WHERE alias_predicate = ?1
+            LIMIT 1
+            ",
+            params![&alias_predicate],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup predicate alias: {}", e)))?;
+
+    if let Some(existing_id) = existing_id {
+        conn.execute(
+            "
+            UPDATE graph_predicate_aliases
+            SET canonical_predicate = ?2, updated_at = ?3
+            WHERE id = ?1
+            ",
+            params![&existing_id, &canonical_predicate, &updated_at],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to update predicate alias: {}", e)))?;
+    } else {
+        conn.execute(
+            "
+            INSERT INTO graph_predicate_aliases (
+              id, alias_predicate, canonical_predicate, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?4)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                &alias_predicate,
+                &canonical_predicate,
+                &updated_at,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to insert predicate alias: {}", e)))?;
+    }
+
+    Ok(Json(UpsertGraphPredicateAliasResponse {
+        alias_predicate,
+        canonical_predicate,
+        updated_at,
+    }))
+}
+
+async fn run_graph_compaction(
+    State(state): State<AppState>,
+    Json(payload): Json<RunGraphCompactionRequest>,
+) -> Result<Json<RunGraphCompactionResponse>, ApiError> {
+    let run_at = Utc::now().to_rfc3339();
+    let job_id = Uuid::new_v4().to_string();
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start tx: {}", e)))?;
+
+    tx.execute(
+        "
+        INSERT INTO graph_compaction_jobs (
+          id, dry_run, status, summary_json, created_at, completed_at
+        ) VALUES (?1, ?2, 'running', '{}', ?3, NULL)
+        ",
+        params![&job_id, if payload.dry_run { 1 } else { 0 }, &run_at],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert compaction job: {}", e)))?;
+
+    let entity_alias_rules = count_graph_entity_aliases(&tx)?;
+    let predicate_alias_rules = count_graph_predicate_aliases(&tx)?;
+    let counts = compact_graph_relationships(&tx, payload.dry_run, &run_at)?;
+
+    let summary_json = json!({
+        "entity_alias_rules": entity_alias_rules,
+        "predicate_alias_rules": predicate_alias_rules,
+        "canonicalized_relationships": counts.canonicalized_relationships,
+        "redirected_relationships": counts.redirected_relationships,
+        "merged_versions_created": counts.merged_versions_created,
+        "compacted_entities": counts.compacted_entities,
+    });
+
+    tx.execute(
+        "
+        UPDATE graph_compaction_jobs
+        SET status = 'completed', summary_json = ?2, completed_at = ?3
+        WHERE id = ?1
+        ",
+        params![
+            &job_id,
+            serde_json::to_string(&summary_json).map_err(|e| ApiError::internal(format!(
+                "failed to encode compaction summary: {}",
+                e
+            )))?,
+            &run_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update compaction job: {}", e)))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(RunGraphCompactionResponse {
+        job_id,
+        dry_run: payload.dry_run,
+        status: "completed".to_string(),
+        run_at,
+        entity_alias_rules,
+        predicate_alias_rules,
+        canonicalized_relationships: counts.canonicalized_relationships,
+        redirected_relationships: counts.redirected_relationships,
+        merged_versions_created: counts.merged_versions_created,
+        compacted_entities: counts.compacted_entities,
+    }))
 }
 
 async fn commit_graph_relationship_proposal(
@@ -769,19 +1121,19 @@ async fn commit_graph_relationship_proposal(
     let committed_at = Utc::now().to_rfc3339();
     let subject_entity_id = ensure_graph_entity(&tx, &payload.subject, &committed_at)?;
     let object_entity_id = ensure_graph_entity(&tx, &payload.object, &committed_at)?;
-
-    let canonical_key = format!(
-        "{}|{}|{}",
-        normalize_token(&payload.subject.canonical_name),
-        normalize_token(&payload.predicate),
-        normalize_token(&payload.object.canonical_name)
-    );
+    let canonical_predicate = canonicalize_graph_predicate(&tx, &payload.predicate)?;
+    let canonical_key = build_graph_relationship_key(
+        &tx,
+        &subject_entity_id,
+        &canonical_predicate,
+        &object_entity_id,
+    )?;
 
     let (relationship_id, old_active_version_id) = ensure_graph_relationship(
         &tx,
         &canonical_key,
         &subject_entity_id,
-        &payload.predicate,
+        &canonical_predicate,
         &object_entity_id,
         &committed_at,
     )?;
@@ -1546,6 +1898,23 @@ fn ensure_graph_entity(
 ) -> Result<String, ApiError> {
     let entity_type = normalize_token(&entity.entity_type);
     let canonical_name = normalize_token(&entity.canonical_name);
+    if let Some(canonical_entity_id) =
+        resolve_graph_entity_alias_id(conn, &entity_type, &canonical_name)?
+    {
+        return Ok(canonical_entity_id);
+    }
+
+    ensure_graph_entity_without_alias(conn, &entity_type, &canonical_name, now)
+}
+
+fn ensure_graph_entity_without_alias(
+    conn: &Connection,
+    entity_type: &str,
+    canonical_name: &str,
+    now: &str,
+) -> Result<String, ApiError> {
+    let entity_type = normalize_token(entity_type);
+    let canonical_name = normalize_token(canonical_name);
 
     let existing: Option<String> = conn
         .query_row(
@@ -1577,6 +1946,135 @@ fn ensure_graph_entity(
     .map_err(|e| ApiError::internal(format!("failed to insert graph entity: {}", e)))?;
 
     Ok(id)
+}
+
+fn load_graph_entity_ref_by_id(
+    conn: &Connection,
+    entity_id: &str,
+) -> Result<GraphEntityRef, ApiError> {
+    conn.query_row(
+        "
+        SELECT entity_type, canonical_name
+        FROM graph_entities
+        WHERE id = ?1
+        LIMIT 1
+        ",
+        params![entity_id],
+        |row| {
+            Ok(GraphEntityRef {
+                entity_type: row.get(0)?,
+                canonical_name: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| ApiError::internal(format!("failed to lookup graph entity by id: {}", e)))?
+    .ok_or_else(|| ApiError::not_found("graph entity not found"))
+}
+
+fn resolve_graph_entity_alias_id(
+    conn: &Connection,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<Option<String>, ApiError> {
+    let entity_type = normalize_token(entity_type);
+    let mut current_name = normalize_token(entity_name);
+    let mut resolved_id = None;
+    let mut visited = BTreeSet::new();
+
+    loop {
+        if !visited.insert(format!("{}:{}", entity_type, current_name)) {
+            return Err(ApiError::internal(format!(
+                "graph entity alias cycle detected for {}:{}",
+                entity_type, entity_name
+            )));
+        }
+
+        let alias_target: Option<String> = conn
+            .query_row(
+                "
+                SELECT canonical_entity_id
+                FROM graph_entity_aliases
+                WHERE entity_type = ?1 AND alias_name = ?2
+                LIMIT 1
+                ",
+                params![&entity_type, &current_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| ApiError::internal(format!("failed to lookup graph alias: {}", e)))?;
+
+        let Some(alias_target) = alias_target else {
+            return Ok(resolved_id);
+        };
+
+        let canonical_entity = load_graph_entity_ref_by_id(conn, &alias_target)?;
+        current_name = canonical_entity.canonical_name;
+        resolved_id = Some(alias_target);
+    }
+}
+
+fn canonicalize_graph_entity_name_for_key(
+    conn: &Connection,
+    entity_type: &str,
+    entity_name: &str,
+) -> Result<String, ApiError> {
+    if let Some(entity_id) = resolve_graph_entity_alias_id(conn, entity_type, entity_name)? {
+        return Ok(load_graph_entity_ref_by_id(conn, &entity_id)?.canonical_name);
+    }
+
+    Ok(normalize_token(entity_name))
+}
+
+fn canonicalize_graph_predicate(conn: &Connection, predicate: &str) -> Result<String, ApiError> {
+    let mut current = normalize_token(predicate);
+    let mut visited = BTreeSet::new();
+
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(ApiError::internal(format!(
+                "graph predicate alias cycle detected for {}",
+                predicate
+            )));
+        }
+
+        let canonical: Option<String> = conn
+            .query_row(
+                "
+                SELECT canonical_predicate
+                FROM graph_predicate_aliases
+                WHERE alias_predicate = ?1
+                LIMIT 1
+                ",
+                params![&current],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                ApiError::internal(format!("failed to lookup graph predicate alias: {}", e))
+            })?;
+
+        let Some(next) = canonical else {
+            return Ok(current);
+        };
+        current = normalize_token(&next);
+    }
+}
+
+fn build_graph_relationship_key(
+    conn: &Connection,
+    subject_entity_id: &str,
+    predicate: &str,
+    object_entity_id: &str,
+) -> Result<String, ApiError> {
+    let subject = load_graph_entity_ref_by_id(conn, subject_entity_id)?;
+    let object = load_graph_entity_ref_by_id(conn, object_entity_id)?;
+    Ok(format!(
+        "{}|{}|{}",
+        subject.canonical_name,
+        normalize_token(predicate),
+        object.canonical_name
+    ))
 }
 
 fn ensure_graph_relationship(
@@ -1625,6 +2123,434 @@ fn ensure_graph_relationship(
     .map_err(|e| ApiError::internal(format!("failed to insert graph relationship: {}", e)))?;
 
     Ok((id, None))
+}
+
+fn count_graph_entity_aliases(conn: &Connection) -> Result<usize, ApiError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM graph_entity_aliases", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| ApiError::internal(format!("failed to count entity aliases: {}", e)))?;
+    Ok(count as usize)
+}
+
+fn count_graph_predicate_aliases(conn: &Connection) -> Result<usize, ApiError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM graph_predicate_aliases", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| ApiError::internal(format!("failed to count predicate aliases: {}", e)))?;
+    Ok(count as usize)
+}
+
+fn load_graph_compaction_candidates(
+    conn: &Connection,
+) -> Result<Vec<GraphCompactionCandidate>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT
+              gr.id,
+              gr.canonical_key,
+              gr.subject_entity_id,
+              se.entity_type,
+              se.canonical_name,
+              gr.predicate,
+              gr.object_entity_id,
+              oe.entity_type,
+              oe.canonical_name,
+              gr.active_version_id,
+              grv.confidence,
+              grv.attributes_json,
+              gr.updated_at
+            FROM graph_relationships gr
+            JOIN graph_entities se ON se.id = gr.subject_entity_id
+            JOIN graph_entities oe ON oe.id = gr.object_entity_id
+            JOIN graph_relationship_versions grv ON grv.id = gr.active_version_id
+            WHERE gr.status = 'active'
+            ORDER BY gr.updated_at DESC, gr.id ASC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare compaction query: {}", e)))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GraphCompactionCandidate {
+                relationship_id: row.get(0)?,
+                canonical_key: row.get(1)?,
+                subject_entity_id: row.get(2)?,
+                subject_entity_type: row.get(3)?,
+                subject_canonical_name: row.get(4)?,
+                predicate: row.get(5)?,
+                object_entity_id: row.get(6)?,
+                object_entity_type: row.get(7)?,
+                object_canonical_name: row.get(8)?,
+                active_version_id: row.get(9)?,
+                active_confidence: row.get(10)?,
+                active_attributes_json: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })
+        .map_err(|e| ApiError::internal(format!("failed to execute compaction query: {}", e)))?;
+
+    let collected: Result<Vec<_>, _> = rows.collect();
+    collected.map_err(|e| ApiError::internal(format!("failed to read compaction rows: {}", e)))
+}
+
+fn compact_graph_relationships(
+    conn: &Connection,
+    dry_run: bool,
+    run_at: &str,
+) -> Result<GraphCompactionCounts, ApiError> {
+    let candidates = load_graph_compaction_candidates(conn)?;
+    let mut grouped: BTreeMap<String, Vec<GraphCompactionPlanEntry>> = BTreeMap::new();
+
+    for candidate in candidates {
+        let target_subject_entity_id = resolve_graph_entity_alias_id(
+            conn,
+            &candidate.subject_entity_type,
+            &candidate.subject_canonical_name,
+        )?
+        .unwrap_or_else(|| candidate.subject_entity_id.clone());
+        let target_object_entity_id = resolve_graph_entity_alias_id(
+            conn,
+            &candidate.object_entity_type,
+            &candidate.object_canonical_name,
+        )?
+        .unwrap_or_else(|| candidate.object_entity_id.clone());
+        let target_predicate = canonicalize_graph_predicate(conn, &candidate.predicate)?;
+        let target_subject_canonical_name =
+            load_graph_entity_ref_by_id(conn, &target_subject_entity_id)?.canonical_name;
+        let target_object_canonical_name =
+            load_graph_entity_ref_by_id(conn, &target_object_entity_id)?.canonical_name;
+        let target_canonical_key = format!(
+            "{}|{}|{}",
+            target_subject_canonical_name, target_predicate, target_object_canonical_name
+        );
+
+        grouped
+            .entry(target_canonical_key.clone())
+            .or_default()
+            .push(GraphCompactionPlanEntry {
+                candidate,
+                target_subject_entity_id,
+                target_subject_canonical_name,
+                target_object_entity_id,
+                target_object_canonical_name,
+                target_predicate,
+                target_canonical_key,
+            });
+    }
+
+    let mut counts = GraphCompactionCounts::default();
+    let mut touched_entity_ids = BTreeSet::new();
+
+    for plan_entries in grouped.values_mut() {
+        plan_entries.sort_by(compare_graph_compaction_priority);
+        let group_has_changes = plan_entries.iter().any(|entry| {
+            entry.candidate.subject_entity_id != entry.target_subject_entity_id
+                || entry.candidate.object_entity_id != entry.target_object_entity_id
+                || entry.candidate.predicate != entry.target_predicate
+                || entry.candidate.canonical_key != entry.target_canonical_key
+        });
+
+        if plan_entries.len() == 1 && !group_has_changes {
+            continue;
+        }
+
+        let winner = plan_entries[0].clone();
+
+        if plan_entries.len() == 1 {
+            counts.canonicalized_relationships += 1;
+            touched_entity_ids.extend(changed_entity_ids(&winner));
+            if !dry_run {
+                update_graph_relationship_to_target(conn, &winner, run_at)?;
+            }
+            continue;
+        }
+
+        counts.redirected_relationships += plan_entries.len() - 1;
+        counts.merged_versions_created += 1;
+        if winner.candidate.canonical_key != winner.target_canonical_key
+            || winner.candidate.subject_entity_id != winner.target_subject_entity_id
+            || winner.candidate.object_entity_id != winner.target_object_entity_id
+            || winner.candidate.predicate != winner.target_predicate
+        {
+            counts.canonicalized_relationships += 1;
+        }
+        touched_entity_ids.extend(changed_entity_ids(&winner));
+        for source in plan_entries.iter().skip(1) {
+            touched_entity_ids.extend(changed_entity_ids(source));
+        }
+
+        if !dry_run {
+            merge_graph_compaction_group(conn, plan_entries, run_at)?;
+        }
+    }
+
+    if !dry_run {
+        counts.compacted_entities =
+            compact_orphaned_graph_entities(conn, &touched_entity_ids, run_at)?;
+    }
+
+    Ok(counts)
+}
+
+fn changed_entity_ids(plan: &GraphCompactionPlanEntry) -> Vec<String> {
+    let mut ids = Vec::new();
+    if plan.candidate.subject_entity_id != plan.target_subject_entity_id {
+        ids.push(plan.candidate.subject_entity_id.clone());
+    }
+    if plan.candidate.object_entity_id != plan.target_object_entity_id {
+        ids.push(plan.candidate.object_entity_id.clone());
+    }
+    ids
+}
+
+fn compare_graph_compaction_priority(
+    a: &GraphCompactionPlanEntry,
+    b: &GraphCompactionPlanEntry,
+) -> Ordering {
+    b.candidate
+        .active_confidence
+        .partial_cmp(&a.candidate.active_confidence)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| compare_rfc3339_desc(&a.candidate.updated_at, &b.candidate.updated_at))
+        .then_with(|| {
+            a.candidate
+                .relationship_id
+                .cmp(&b.candidate.relationship_id)
+        })
+}
+
+fn compare_rfc3339_desc(a: &str, b: &str) -> Ordering {
+    let a_ts = DateTime::parse_from_rfc3339(a)
+        .map(|dt| dt.timestamp())
+        .unwrap_or_default();
+    let b_ts = DateTime::parse_from_rfc3339(b)
+        .map(|dt| dt.timestamp())
+        .unwrap_or_default();
+    b_ts.cmp(&a_ts)
+}
+
+fn update_graph_relationship_to_target(
+    conn: &Connection,
+    plan: &GraphCompactionPlanEntry,
+    now: &str,
+) -> Result<(), ApiError> {
+    conn.execute(
+        "
+        UPDATE graph_relationships
+        SET canonical_key = ?2,
+            subject_entity_id = ?3,
+            predicate = ?4,
+            object_entity_id = ?5,
+            updated_at = ?6
+        WHERE id = ?1
+        ",
+        params![
+            &plan.candidate.relationship_id,
+            &plan.target_canonical_key,
+            &plan.target_subject_entity_id,
+            &plan.target_predicate,
+            &plan.target_object_entity_id,
+            now,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update canonical relationship: {}", e)))?;
+
+    Ok(())
+}
+
+fn merge_graph_compaction_group(
+    conn: &Connection,
+    plan_entries: &[GraphCompactionPlanEntry],
+    now: &str,
+) -> Result<(), ApiError> {
+    let winner = plan_entries
+        .first()
+        .ok_or_else(|| ApiError::internal("missing graph compaction winner"))?;
+    let new_version_id = Uuid::new_v4().to_string();
+    let new_version_number =
+        next_graph_relationship_version_number(conn, &winner.candidate.relationship_id)?;
+
+    let mut merged_attributes = Map::new();
+    let mut merged_evidence_ids = BTreeSet::new();
+    let merged_confidence = plan_entries
+        .iter()
+        .map(|entry| entry.candidate.active_confidence)
+        .fold(0.0_f32, f32::max);
+
+    for source in plan_entries.iter().skip(1) {
+        conn.execute(
+            "
+            UPDATE graph_relationships
+            SET status = 'redirected',
+                canonical_key = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            ",
+            params![
+                &source.candidate.relationship_id,
+                format!(
+                    "redirected:{}:{}",
+                    source.candidate.canonical_key, source.candidate.relationship_id
+                ),
+                now,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to redirect relationship: {}", e)))?;
+    }
+
+    for entry in plan_entries.iter().rev() {
+        let attributes_value: Value = serde_json::from_str(&entry.candidate.active_attributes_json)
+            .map_err(|e| {
+                ApiError::internal(format!("failed to decode compaction attributes: {}", e))
+            })?;
+        let object = attributes_value
+            .as_object()
+            .ok_or_else(|| ApiError::internal("graph attributes_json must be an object"))?;
+        for (key, value) in object {
+            merged_attributes.insert(key.clone(), value.clone());
+        }
+        for evidence_id in
+            load_evidence_for_graph_relationship_version(conn, &entry.candidate.active_version_id)?
+        {
+            merged_evidence_ids.insert(evidence_id);
+        }
+    }
+
+    conn.execute(
+        "
+        UPDATE graph_relationship_versions
+        SET state = 'superseded', valid_to = ?2
+        WHERE id = ?1
+        ",
+        params![&winner.candidate.active_version_id, now],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to supersede winner version: {}", e)))?;
+
+    conn.execute(
+        "
+        INSERT INTO graph_relationship_versions (
+          id, relationship_id, version_number, state, confidence, attributes_json,
+          supersedes_version_id, valid_from, valid_to, created_at
+        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, NULL, ?7)
+        ",
+        params![
+            &new_version_id,
+            &winner.candidate.relationship_id,
+            new_version_number,
+            merged_confidence,
+            serde_json::to_string(&Value::Object(merged_attributes)).map_err(|e| {
+                ApiError::internal(format!("failed to encode merged graph attributes: {}", e))
+            })?,
+            &winner.candidate.active_version_id,
+            now,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert merged graph version: {}", e)))?;
+
+    for evidence_id in merged_evidence_ids {
+        conn.execute(
+            "
+            INSERT INTO graph_relationship_evidence_links (
+              id, relationship_version_id, evidence_record_id, created_at
+            ) VALUES (?1, ?2, ?3, ?4)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                &new_version_id,
+                evidence_id,
+                now,
+            ],
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to insert merged graph evidence: {}", e))
+        })?;
+    }
+
+    update_graph_relationship_to_target(conn, winner, now)?;
+    conn.execute(
+        "
+        UPDATE graph_relationships
+        SET active_version_id = ?2, status = 'active', updated_at = ?3
+        WHERE id = ?1
+        ",
+        params![&winner.candidate.relationship_id, &new_version_id, now],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to activate merged relationship: {}", e)))?;
+
+    for source in plan_entries.iter().skip(1) {
+        conn.execute(
+            "
+            INSERT OR REPLACE INTO graph_relationship_redirects (
+              id, source_relationship_id, target_relationship_id, reason_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                Uuid::new_v4().to_string(),
+                &source.candidate.relationship_id,
+                &winner.candidate.relationship_id,
+                serde_json::to_string(&json!({
+                    "source_canonical_key": source.candidate.canonical_key,
+                    "target_canonical_key": winner.target_canonical_key,
+                    "target_subject_canonical_name": winner.target_subject_canonical_name,
+                    "target_object_canonical_name": winner.target_object_canonical_name,
+                    "target_predicate": winner.target_predicate,
+                }))
+                .map_err(|e| ApiError::internal(format!(
+                    "failed to encode graph redirect reason: {}",
+                    e
+                )))?,
+                now,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to insert graph redirect: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+fn compact_orphaned_graph_entities(
+    conn: &Connection,
+    entity_ids: &BTreeSet<String>,
+    now: &str,
+) -> Result<usize, ApiError> {
+    let mut compacted = 0usize;
+    for entity_id in entity_ids {
+        let active_reference: Option<String> = conn
+            .query_row(
+                "
+                SELECT id
+                FROM graph_relationships
+                WHERE status = 'active'
+                  AND (subject_entity_id = ?1 OR object_entity_id = ?1)
+                LIMIT 1
+                ",
+                params![entity_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                ApiError::internal(format!("failed to lookup active entity refs: {}", e))
+            })?;
+
+        if active_reference.is_none() {
+            compacted += conn
+                .execute(
+                    "
+                    UPDATE graph_entities
+                    SET status = 'compacted', updated_at = ?2
+                    WHERE id = ?1 AND status != 'compacted'
+                    ",
+                    params![entity_id, now],
+                )
+                .map_err(|e| ApiError::internal(format!("failed to compact entity: {}", e)))?;
+        }
+    }
+
+    Ok(compacted)
 }
 
 fn next_graph_relationship_version_number(
@@ -1922,6 +2848,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0004_graph_confidence.sql"
     ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0005_graph_canonicalization.sql"
+    ))?;
     Ok(())
 }
 
@@ -1952,8 +2881,13 @@ fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::CreateProposalRequest;
+    use rusqlite::{params, Connection};
     use serde_json::json;
+
+    use super::{
+        apply_graph_confidence_migration, compact_graph_relationships, ensure_graph_entity,
+        ensure_graph_entity_without_alias, CreateProposalRequest, GraphEntityRef,
+    };
 
     #[test]
     fn confidence_validation() {
@@ -1967,5 +2901,294 @@ mod tests {
         };
 
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn ensure_graph_entity_resolves_entity_alias_to_canonical_entity() {
+        let conn = test_conn();
+        let now = "2026-04-23T20:00:00+00:00";
+        let canonical_entity_id = ensure_graph_entity_without_alias(&conn, "person", "eyasu", now)
+            .expect("canonical entity should be inserted");
+
+        conn.execute(
+            "
+            INSERT INTO graph_entity_aliases (
+              id, entity_type, alias_name, canonical_entity_id, created_at, updated_at
+            ) VALUES (?1, 'person', 'eyas', ?2, ?3, ?3)
+            ",
+            params!["alias-1", &canonical_entity_id, now],
+        )
+        .expect("alias should be inserted");
+
+        let resolved_id = ensure_graph_entity(
+            &conn,
+            &GraphEntityRef {
+                entity_type: "person".to_string(),
+                canonical_name: "Eyas".to_string(),
+            },
+            now,
+        )
+        .expect("alias should resolve");
+
+        assert_eq!(resolved_id, canonical_entity_id);
+        let entity_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM graph_entities", [], |row| row.get(0))
+            .expect("entity count should be queryable");
+        assert_eq!(entity_count, 1);
+    }
+
+    #[test]
+    fn graph_compaction_merges_duplicate_alias_relationships() {
+        let conn = test_conn();
+        let created_at = "2026-04-23T20:00:00+00:00";
+        let run_at = "2026-04-23T20:05:00+00:00";
+
+        let person_id = insert_entity(&conn, "person-eyasu", "person", "eyasu", created_at);
+        let rust_id = insert_entity(&conn, "lang-rust", "language", "rust", created_at);
+        let rustlang_id = insert_entity(&conn, "lang-rustlang", "language", "rustlang", created_at);
+
+        conn.execute(
+            "
+            INSERT INTO graph_entity_aliases (
+              id, entity_type, alias_name, canonical_entity_id, created_at, updated_at
+            ) VALUES (?1, 'language', 'rustlang', ?2, ?3, ?3)
+            ",
+            params!["entity-alias-1", &rust_id, created_at],
+        )
+        .expect("entity alias should be inserted");
+        conn.execute(
+            "
+            INSERT INTO graph_predicate_aliases (
+              id, alias_predicate, canonical_predicate, created_at, updated_at
+            ) VALUES (?1, 'likes', 'prefers', ?2, ?2)
+            ",
+            params!["predicate-alias-1", created_at],
+        )
+        .expect("predicate alias should be inserted");
+
+        insert_evidence(&conn, "evidence-a", created_at);
+        insert_evidence(&conn, "evidence-b", created_at);
+
+        insert_relationship_with_active_version(
+            &conn,
+            "rel-canonical",
+            "eyasu|prefers|rust",
+            &person_id,
+            "prefers",
+            &rust_id,
+            "ver-canonical",
+            1,
+            0.65,
+            json!({"source":"canonical","strength":"medium"}),
+            &["evidence-a"],
+            "2026-04-23T20:01:00+00:00",
+        );
+        insert_relationship_with_active_version(
+            &conn,
+            "rel-alias",
+            "eyasu|likes|rustlang",
+            &person_id,
+            "likes",
+            &rustlang_id,
+            "ver-alias",
+            1,
+            0.91,
+            json!({"source":"alias","strength":"high"}),
+            &["evidence-b"],
+            "2026-04-23T20:02:00+00:00",
+        );
+
+        let counts =
+            compact_graph_relationships(&conn, false, run_at).expect("compaction should work");
+
+        assert_eq!(counts.canonicalized_relationships, 1);
+        assert_eq!(counts.redirected_relationships, 1);
+        assert_eq!(counts.merged_versions_created, 1);
+        assert_eq!(counts.compacted_entities, 1);
+
+        let alias_status: String = conn
+            .query_row(
+                "SELECT status FROM graph_relationships WHERE id = 'rel-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("winner status should be queryable");
+        assert_eq!(alias_status, "active");
+
+        let canonical_status: String = conn
+            .query_row(
+                "SELECT status FROM graph_relationships WHERE id = 'rel-canonical'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("source status should be queryable");
+        assert_eq!(canonical_status, "redirected");
+
+        let (predicate, object_entity_id, active_version_id): (String, String, String) = conn
+            .query_row(
+                "
+                SELECT predicate, object_entity_id, active_version_id
+                FROM graph_relationships
+                WHERE id = 'rel-alias'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("winner relationship should be queryable");
+        assert_eq!(predicate, "prefers");
+        assert_eq!(object_entity_id, rust_id);
+
+        let active_confidence: f32 = conn
+            .query_row(
+                "SELECT confidence FROM graph_relationship_versions WHERE id = ?1",
+                params![&active_version_id],
+                |row| row.get(0),
+            )
+            .expect("merged confidence should be queryable");
+        assert_eq!(active_confidence, 0.91);
+
+        let merged_evidence_count: i64 = conn
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM graph_relationship_evidence_links
+                WHERE relationship_version_id = ?1
+                ",
+                params![&active_version_id],
+                |row| row.get(0),
+            )
+            .expect("merged evidence count should be queryable");
+        assert_eq!(merged_evidence_count, 2);
+
+        let compacted_entity_status: String = conn
+            .query_row(
+                "SELECT status FROM graph_entities WHERE id = ?1",
+                params![&rustlang_id],
+                |row| row.get(0),
+            )
+            .expect("compacted entity status should be queryable");
+        assert_eq!(compacted_entity_status, "compacted");
+    }
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db should open");
+        conn.execute_batch(include_str!("../../../db/migrations/0001_init.sql"))
+            .expect("base migration should apply");
+        conn.execute_batch(include_str!("../../../db/migrations/0002_indexes.sql"))
+            .expect("index migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0003_knowledge_graph.sql"
+        ))
+        .expect("graph migration should apply");
+        apply_graph_confidence_migration(&conn).expect("confidence migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0004_graph_confidence.sql"
+        ))
+        .expect("confidence index migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0005_graph_canonicalization.sql"
+        ))
+        .expect("graph canonicalization migration should apply");
+        conn
+    }
+
+    fn insert_entity(
+        conn: &Connection,
+        id: &str,
+        entity_type: &str,
+        canonical_name: &str,
+        now: &str,
+    ) -> String {
+        conn.execute(
+            "
+            INSERT INTO graph_entities (
+              id, entity_type, canonical_name, attributes_json, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, '{}', 'active', ?4, ?4)
+            ",
+            params![id, entity_type, canonical_name, now],
+        )
+        .expect("entity should insert");
+        id.to_string()
+    }
+
+    fn insert_evidence(conn: &Connection, id: &str, now: &str) {
+        conn.execute(
+            "
+            INSERT INTO evidence_records (
+              id, source_type, source_ref, content_type, content, created_at, ingested_at, checksum
+            ) VALUES (?1, 'test', ?2, 'text/plain', 'content', ?3, ?3, ?4)
+            ",
+            params![id, format!("ref-{}", id), now, format!("checksum-{}", id)],
+        )
+        .expect("evidence should insert");
+    }
+
+    fn insert_relationship_with_active_version(
+        conn: &Connection,
+        relationship_id: &str,
+        canonical_key: &str,
+        subject_entity_id: &str,
+        predicate: &str,
+        object_entity_id: &str,
+        version_id: &str,
+        version_number: i64,
+        confidence: f32,
+        attributes_json: serde_json::Value,
+        evidence_ids: &[&str],
+        now: &str,
+    ) {
+        conn.execute(
+            "
+            INSERT INTO graph_relationships (
+              id, canonical_key, subject_entity_id, predicate, object_entity_id,
+              active_version_id, status, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)
+            ",
+            params![
+                relationship_id,
+                canonical_key,
+                subject_entity_id,
+                predicate,
+                object_entity_id,
+                version_id,
+                now,
+            ],
+        )
+        .expect("relationship should insert");
+
+        conn.execute(
+            "
+            INSERT INTO graph_relationship_versions (
+              id, relationship_id, version_number, state, confidence, attributes_json,
+              supersedes_version_id, valid_from, valid_to, created_at
+            ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, NULL, ?6, NULL, ?6)
+            ",
+            params![
+                version_id,
+                relationship_id,
+                version_number,
+                confidence,
+                serde_json::to_string(&attributes_json).expect("attributes should encode"),
+                now,
+            ],
+        )
+        .expect("version should insert");
+
+        for evidence_id in evidence_ids {
+            conn.execute(
+                "
+                INSERT INTO graph_relationship_evidence_links (
+                  id, relationship_version_id, evidence_record_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4)
+                ",
+                params![
+                    format!("link-{}-{}", version_id, evidence_id),
+                    version_id,
+                    evidence_id,
+                    now
+                ],
+            )
+            .expect("evidence link should insert");
+        }
     }
 }

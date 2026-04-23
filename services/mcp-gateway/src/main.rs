@@ -1560,6 +1560,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0004_graph_confidence.sql"
     ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0005_graph_canonicalization.sql"
+    ))?;
     Ok(())
 }
 
