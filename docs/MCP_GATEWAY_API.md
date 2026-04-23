@@ -142,8 +142,11 @@ Request:
 {
   "agent_id": "graph-agent",
   "seed_entities": ["eyasu"],
+  "predicates": ["prefers"],
+  "entity_types": ["language"],
+  "min_confidence": 0.8,
   "max_hops": 2,
-  "rank_by": "hop_then_recency",
+  "rank_by": "hop_then_confidence_then_recency",
   "limit": 10
 }
 ```
@@ -152,8 +155,11 @@ Request options:
 
 - `entity_canonical_name`: backward-compatible single seed.
 - `seed_entities`: one or more seed entities for neighborhood traversal.
+- `predicates`: optional relationship predicate filter.
+- `entity_types`: optional entity-type filter; matches either side of a relationship.
+- `min_confidence`: optional lower bound for active relationship confidence.
 - `max_hops`: traversal depth (1-4, default `1`).
-- `rank_by`: `hop_then_recency` (default) or `recency`.
+- `rank_by`: `hop_then_confidence_then_recency` (default), `hop_then_recency`, `confidence_then_recency`, or `recency`.
 
 Response:
 
@@ -168,16 +174,18 @@ Response:
       "subject": { "entity_type": "person", "canonical_name": "eyasu" },
       "predicate": "prefers",
       "object": { "entity_type": "language", "canonical_name": "rust" },
+      "confidence": 0.93,
       "attributes_json": { "source": "manual" },
       "redacted_fields": ["strength"],
       "hop_distance": 1,
-      "rank_score": 1780215619.0
+      "rank_score": 1002726971430.0791
     }
   ]
 }
 ```
 
 Graph retrieval writes `retrieval_audit_events` with `request_type = graph_retrieve`.
+The audit payload includes traversal and filter parameters (`seed_entities`, `max_hops`, `rank_by`, `predicates`, `entity_types`, `min_confidence`).
 
 ## POST /v1/audit/events/list
 

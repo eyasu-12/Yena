@@ -63,6 +63,11 @@ struct GraphRetrieveRequest {
     entity_canonical_name: Option<String>,
     #[serde(default)]
     seed_entities: Vec<String>,
+    #[serde(default)]
+    predicates: Vec<String>,
+    #[serde(default)]
+    entity_types: Vec<String>,
+    min_confidence: Option<f32>,
     max_hops: Option<usize>,
     rank_by: Option<String>,
 }
@@ -148,6 +153,7 @@ struct GraphRelationshipProjection {
     subject: GraphEntityProjection,
     predicate: String,
     object: GraphEntityProjection,
+    confidence: f32,
     attributes_json: Value,
     redacted_fields: Vec<String>,
     hop_distance: Option<usize>,
@@ -251,6 +257,7 @@ struct GraphRelationshipRow {
     predicate: String,
     object_entity_type: String,
     object_canonical_name: String,
+    confidence: f32,
     attributes_json: String,
     updated_at: String,
 }
@@ -259,6 +266,8 @@ struct GraphRelationshipRow {
 enum GraphRankBy {
     HopThenRecency,
     Recency,
+    HopThenConfidenceThenRecency,
+    ConfidenceThenRecency,
 }
 
 #[derive(Debug)]
@@ -506,10 +515,24 @@ fn mcp_tools_catalog() -> Value {
                         "type": "array",
                         "items": { "type": "string" }
                     },
+                    "predicates": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "entity_types": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
                     "max_hops": { "type": "integer", "minimum": 1, "maximum": 4 },
                     "rank_by": {
                         "type": "string",
-                        "enum": ["hop_then_recency", "recency"]
+                        "enum": [
+                            "hop_then_recency",
+                            "recency",
+                            "hop_then_confidence_then_recency",
+                            "confidence_then_recency"
+                        ]
                     }
                 }
             }
@@ -829,6 +852,15 @@ async fn graph_retrieve(
         payload.entity_canonical_name.as_deref(),
         &payload.seed_entities,
     );
+    let predicate_filters = collect_normalized_tokens(&payload.predicates);
+    let entity_type_filters = collect_normalized_tokens(&payload.entity_types);
+    if let Some(min_confidence) = payload.min_confidence {
+        if !(0.0..=1.0).contains(&min_confidence) {
+            return Err(ApiError::bad_request(
+                "min_confidence must be between 0.0 and 1.0",
+            ));
+        }
+    }
 
     let conn = open_db(&state.db_path)?;
     let scopes = load_scopes(&conn, &payload.agent_id)?;
@@ -859,7 +891,13 @@ async fn graph_retrieve(
     }
 
     let rows = load_active_graph_relationships(&conn)?;
-    let ranked_rows = rank_graph_relationships(rows, &seed_entities, max_hops, rank_by)?;
+    let filtered_rows = filter_graph_relationships(
+        rows,
+        &predicate_filters,
+        &entity_type_filters,
+        payload.min_confidence,
+    );
+    let ranked_rows = rank_graph_relationships(filtered_rows, &seed_entities, max_hops, rank_by)?;
     let mut projections = Vec::new();
 
     for ranked in ranked_rows.into_iter().take(limit) {
@@ -882,6 +920,7 @@ async fn graph_retrieve(
                 entity_type: ranked.row.object_entity_type,
                 canonical_name: ranked.row.object_canonical_name,
             },
+            confidence: ranked.row.confidence,
             attributes_json: redacted_attributes,
             redacted_fields,
             hop_distance: ranked.hop_distance,
@@ -906,6 +945,9 @@ async fn graph_retrieve(
         "seed_entities": seed_entities,
         "max_hops": max_hops,
         "rank_by": graph_rank_by_name(rank_by),
+        "predicates": predicate_filters.iter().cloned().collect::<Vec<_>>(),
+        "entity_types": entity_type_filters.iter().cloned().collect::<Vec<_>>(),
+        "min_confidence": payload.min_confidence,
     });
 
     insert_audit_event(
@@ -1098,6 +1140,7 @@ fn load_active_graph_relationships(
           gr.predicate,
           oe.entity_type,
           oe.canonical_name,
+          grv.confidence,
           grv.attributes_json,
           gr.updated_at
         FROM graph_relationships gr
@@ -1122,8 +1165,9 @@ fn load_active_graph_relationships(
                 predicate: row.get(4)?,
                 object_entity_type: row.get(5)?,
                 object_canonical_name: row.get(6)?,
-                attributes_json: row.get(7)?,
-                updated_at: row.get(8)?,
+                confidence: row.get(7)?,
+                attributes_json: row.get(8)?,
+                updated_at: row.get(9)?,
             })
         })
         .map_err(|e| ApiError::internal(format!("failed to execute graph query: {}", e)))?;
@@ -1152,14 +1196,26 @@ fn collect_seed_entities(
     dedup.into_iter().collect()
 }
 
+fn collect_normalized_tokens(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn parse_graph_rank_by(value: Option<&str>) -> Result<GraphRankBy, ApiError> {
     match value.map(|v| v.trim().to_lowercase()) {
-        None => Ok(GraphRankBy::HopThenRecency),
-        Some(v) if v.is_empty() => Ok(GraphRankBy::HopThenRecency),
+        None => Ok(GraphRankBy::HopThenConfidenceThenRecency),
+        Some(v) if v.is_empty() => Ok(GraphRankBy::HopThenConfidenceThenRecency),
         Some(v) if v == "hop_then_recency" => Ok(GraphRankBy::HopThenRecency),
         Some(v) if v == "recency" => Ok(GraphRankBy::Recency),
+        Some(v) if v == "hop_then_confidence_then_recency" => {
+            Ok(GraphRankBy::HopThenConfidenceThenRecency)
+        }
+        Some(v) if v == "confidence_then_recency" => Ok(GraphRankBy::ConfidenceThenRecency),
         Some(v) => Err(ApiError::bad_request(format!(
-            "invalid rank_by '{}'; expected one of: hop_then_recency, recency",
+            "invalid rank_by '{}'; expected one of: hop_then_recency, recency, hop_then_confidence_then_recency, confidence_then_recency",
             v
         ))),
     }
@@ -1169,7 +1225,39 @@ fn graph_rank_by_name(rank_by: GraphRankBy) -> &'static str {
     match rank_by {
         GraphRankBy::HopThenRecency => "hop_then_recency",
         GraphRankBy::Recency => "recency",
+        GraphRankBy::HopThenConfidenceThenRecency => "hop_then_confidence_then_recency",
+        GraphRankBy::ConfidenceThenRecency => "confidence_then_recency",
     }
+}
+
+fn filter_graph_relationships(
+    rows: Vec<GraphRelationshipRow>,
+    predicate_filters: &BTreeSet<String>,
+    entity_type_filters: &BTreeSet<String>,
+    min_confidence: Option<f32>,
+) -> Vec<GraphRelationshipRow> {
+    rows.into_iter()
+        .filter(|row| {
+            if !predicate_filters.is_empty() && !predicate_filters.contains(&row.predicate) {
+                return false;
+            }
+
+            if !entity_type_filters.is_empty()
+                && !entity_type_filters.contains(&row.subject_entity_type)
+                && !entity_type_filters.contains(&row.object_entity_type)
+            {
+                return false;
+            }
+
+            if let Some(min_confidence) = min_confidence {
+                if row.confidence < min_confidence {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect()
 }
 
 fn rank_graph_relationships(
@@ -1196,9 +1284,15 @@ fn rank_graph_relationships(
         rows.into_iter()
             .enumerate()
             .map(|(idx, row)| RankedGraphRow {
+                rank_score: compute_graph_rank_score(
+                    rank_by,
+                    None,
+                    row.confidence,
+                    recency_seconds[idx],
+                    max_hops,
+                ),
                 row,
                 hop_distance: None,
-                rank_score: recency_seconds[idx] as f64,
             })
             .collect::<Vec<_>>()
     } else {
@@ -1267,20 +1361,60 @@ fn rank_graph_relationships(
         relationship_hops
             .into_iter()
             .map(|(idx, hop_distance)| RankedGraphRow {
+                rank_score: compute_graph_rank_score(
+                    rank_by,
+                    Some(hop_distance),
+                    rows[idx].confidence,
+                    recency_seconds[idx],
+                    max_hops,
+                ),
                 row: rows[idx].clone(),
                 hop_distance: Some(hop_distance),
-                rank_score: 10_000_000.0 - ((hop_distance as f64) * 1_000_000.0)
-                    + (recency_seconds[idx] as f64),
             })
             .collect::<Vec<_>>()
     };
 
-    ranked.sort_by(|a, b| match rank_by {
-        GraphRankBy::Recency => compare_recency_then_hop(a, b),
-        GraphRankBy::HopThenRecency => compare_hop_then_recency(a, b),
-    });
+    ranked.sort_by(|a, b| compare_ranked_graph_rows(a, b, rank_by));
 
     Ok(ranked)
+}
+
+fn compute_graph_rank_score(
+    rank_by: GraphRankBy,
+    hop_distance: Option<usize>,
+    confidence: f32,
+    recency_seconds: i64,
+    max_hops: usize,
+) -> f64 {
+    let hop_score = hop_distance
+        .map(|hop| (max_hops.saturating_sub(hop) + 1) as f64)
+        .unwrap_or(0.0);
+    let confidence_score = confidence as f64;
+    let recency_score = recency_seconds as f64;
+
+    match rank_by {
+        GraphRankBy::HopThenRecency => (hop_score * 1_000_000_000_000.0) + recency_score,
+        GraphRankBy::Recency => (recency_score * 10.0) + confidence_score,
+        GraphRankBy::HopThenConfidenceThenRecency => {
+            (hop_score * 1_000_000_000_000.0) + (confidence_score * 1_000_000_000.0) + recency_score
+        }
+        GraphRankBy::ConfidenceThenRecency => {
+            (confidence_score * 1_000_000_000_000.0) + recency_score
+        }
+    }
+}
+
+fn compare_ranked_graph_rows(
+    a: &RankedGraphRow,
+    b: &RankedGraphRow,
+    rank_by: GraphRankBy,
+) -> Ordering {
+    match rank_by {
+        GraphRankBy::Recency => compare_recency_then_confidence_then_hop(a, b),
+        GraphRankBy::HopThenRecency => compare_hop_then_recency_then_confidence(a, b),
+        GraphRankBy::HopThenConfidenceThenRecency => compare_hop_then_confidence_then_recency(a, b),
+        GraphRankBy::ConfidenceThenRecency => compare_confidence_then_recency_then_hop(a, b),
+    }
 }
 
 fn compare_hop_then_recency(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
@@ -1297,6 +1431,38 @@ fn compare_recency_then_hop(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering 
         let b_hop = b.hop_distance.unwrap_or(usize::MAX);
         a_hop.cmp(&b_hop)
     })
+}
+
+fn compare_hop_then_recency_then_confidence(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    compare_hop_then_recency(a, b).then_with(|| compare_confidence_desc(a, b))
+}
+
+fn compare_recency_then_confidence_then_hop(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    compare_updated_at_desc(&a.row.updated_at, &b.row.updated_at)
+        .then_with(|| compare_confidence_desc(a, b))
+        .then_with(|| compare_recency_then_hop(a, b))
+}
+
+fn compare_hop_then_confidence_then_recency(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    let a_hop = a.hop_distance.unwrap_or(usize::MAX);
+    let b_hop = b.hop_distance.unwrap_or(usize::MAX);
+    a_hop
+        .cmp(&b_hop)
+        .then_with(|| compare_confidence_desc(a, b))
+        .then_with(|| compare_updated_at_desc(&a.row.updated_at, &b.row.updated_at))
+}
+
+fn compare_confidence_then_recency_then_hop(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    compare_confidence_desc(a, b)
+        .then_with(|| compare_updated_at_desc(&a.row.updated_at, &b.row.updated_at))
+        .then_with(|| compare_recency_then_hop(a, b))
+}
+
+fn compare_confidence_desc(a: &RankedGraphRow, b: &RankedGraphRow) -> Ordering {
+    b.row
+        .confidence
+        .partial_cmp(&a.row.confidence)
+        .unwrap_or(Ordering::Equal)
 }
 
 fn compare_updated_at_desc(a: &str, b: &str) -> Ordering {
@@ -1390,6 +1556,35 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0003_knowledge_graph.sql"
     ))?;
+    apply_graph_confidence_migration(&conn)?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0004_graph_confidence.sql"
+    ))?;
+    Ok(())
+}
+
+fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(graph_relationship_versions)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut has_confidence = false;
+    for column in columns {
+        if column? == "confidence" {
+            has_confidence = true;
+            break;
+        }
+    }
+
+    if !has_confidence {
+        conn.execute(
+            "
+            ALTER TABLE graph_relationship_versions
+            ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0
+            ",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1399,7 +1594,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::apply_redaction;
+    use super::{
+        apply_redaction, filter_graph_relationships, rank_graph_relationships, GraphRankBy,
+        GraphRelationshipRow,
+    };
 
     #[test]
     fn redaction_removes_top_level_fields() {
@@ -1412,5 +1610,86 @@ mod tests {
 
         assert_eq!(out, json!({"name":"Eyasu"}));
         assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn graph_filter_respects_predicate_entity_type_and_confidence() {
+        let rows = vec![
+            graph_row(
+                "prefers",
+                "person",
+                "language",
+                0.92,
+                "2026-02-16T02:00:00+00:00",
+            ),
+            graph_row("uses", "person", "tool", 0.55, "2026-02-16T01:00:00+00:00"),
+        ];
+
+        let predicates = BTreeSet::from(["prefers".to_string()]);
+        let entity_types = BTreeSet::from(["language".to_string()]);
+        let filtered = filter_graph_relationships(rows, &predicates, &entity_types, Some(0.8));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].predicate, "prefers");
+        assert_eq!(filtered[0].object_entity_type, "language");
+    }
+
+    #[test]
+    fn confidence_ranking_changes_order_for_same_hop() {
+        let rows = vec![
+            graph_row(
+                "prefers",
+                "person",
+                "language",
+                0.45,
+                "2026-02-16T03:00:00+00:00",
+            ),
+            graph_row(
+                "prefers",
+                "person",
+                "tool",
+                0.95,
+                "2026-02-16T02:00:00+00:00",
+            ),
+        ];
+
+        let hop_then_recency = rank_graph_relationships(
+            rows.clone(),
+            &["eyasu".to_string()],
+            1,
+            GraphRankBy::HopThenRecency,
+        )
+        .expect("ranking should succeed");
+        assert_eq!(hop_then_recency[0].row.object_entity_type, "language");
+
+        let hop_then_confidence = rank_graph_relationships(
+            rows,
+            &["eyasu".to_string()],
+            1,
+            GraphRankBy::HopThenConfidenceThenRecency,
+        )
+        .expect("ranking should succeed");
+        assert_eq!(hop_then_confidence[0].row.object_entity_type, "tool");
+    }
+
+    fn graph_row(
+        predicate: &str,
+        subject_entity_type: &str,
+        object_entity_type: &str,
+        confidence: f32,
+        updated_at: &str,
+    ) -> GraphRelationshipRow {
+        GraphRelationshipRow {
+            relationship_id: format!("rel-{}-{}", predicate, object_entity_type),
+            version_id: format!("ver-{}-{}", predicate, object_entity_type),
+            subject_entity_type: subject_entity_type.to_string(),
+            subject_canonical_name: "eyasu".to_string(),
+            predicate: predicate.to_string(),
+            object_entity_type: object_entity_type.to_string(),
+            object_canonical_name: format!("object-{}", object_entity_type),
+            confidence,
+            attributes_json: "{}".to_string(),
+            updated_at: updated_at.to_string(),
+        }
     }
 }

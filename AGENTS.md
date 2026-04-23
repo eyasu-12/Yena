@@ -15,6 +15,26 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 
 ## Decision Log
 
+### 2026-04-23
+
+- Added graph confidence persistence migration:
+  - `db/migrations/0004_graph_confidence.sql`
+- Extended graph version storage to preserve proposal confidence at commit time.
+- Extended compiler graph read APIs:
+  - `GET /v1/graph/relationships/{id}` now returns active version confidence.
+  - `GET /v1/graph/relationships/{id}/history` now returns per-version confidence.
+- Extended graph retrieval in `mcp-gateway`:
+  - request supports `predicates`, `entity_types`, `min_confidence`
+  - ranking supports `hop_then_confidence_then_recency` and `confidence_then_recency`
+  - default graph ranking now prefers hop distance, then confidence, then recency
+  - response now includes relationship `confidence`
+- Added unit coverage for graph filtering and confidence-aware ranking.
+- Verified live graph confidence behavior:
+  - default ranking returns the higher-confidence same-hop edge ahead of a newer low-confidence edge
+  - `rank_by=hop_then_recency` still returns the newer same-hop edge first
+  - semantic filters (`predicates`, `entity_types`, `min_confidence`) narrow retrieval as expected
+- Verified updated workspace with `cargo fmt` and `cargo test`.
+
 ### 2026-02-16
 
 - Created foundational docs:
@@ -140,9 +160,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [x] Memory compiler v1 implemented
 - [~] MCP gateway v1 implemented (JSON-RPC tool surface done; broader MCP spec coverage still pending)
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
-- [~] Smart memory foundation implemented (graph schema + versioned relationship compiler complete; graph-aware retrieval in MCP pending)
-- [~] Smart memory foundation implemented (graph schema + versioned relationship compiler + MCP graph retrieval complete; graph traversal/ranking improvements pending)
-- [~] Smart memory foundation implemented (graph traversal/ranking added; advanced multi-hop ranking heuristics still pending)
+- [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, and ranking heuristics complete; broader reasoning and graph compaction still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released

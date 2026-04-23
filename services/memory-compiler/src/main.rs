@@ -315,6 +315,7 @@ struct GraphRelationshipViewResponse {
     predicate: String,
     object: GraphEntityRef,
     active_version_id: String,
+    confidence: f32,
     attributes_json: Value,
     evidence_record_ids: Vec<String>,
 }
@@ -333,6 +334,7 @@ struct GraphRelationshipVersionEntry {
     version_id: String,
     version_number: i64,
     state: String,
+    confidence: f32,
     attributes_json: Value,
     supersedes_version_id: Option<String>,
     valid_from: String,
@@ -409,6 +411,7 @@ struct ProposalRow {
     proposal_type: String,
     subject_key: String,
     payload_json: String,
+    confidence: f32,
     status: String,
 }
 
@@ -801,14 +804,15 @@ async fn commit_graph_relationship_proposal(
     tx.execute(
         "
         INSERT INTO graph_relationship_versions (
-          id, relationship_id, version_number, state, attributes_json,
+          id, relationship_id, version_number, state, confidence, attributes_json,
           supersedes_version_id, valid_from, valid_to, created_at
-        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, NULL, ?6)
+        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, NULL, ?7)
         ",
         params![
             &new_version_id,
             &relationship_id,
             version_number,
+            proposal.confidence,
             serde_json::to_string(&payload.attributes_json).map_err(|e| ApiError::internal(
                 format!("failed to encode attributes_json: {}", e)
             ))?,
@@ -891,6 +895,7 @@ async fn get_graph_relationship(
         String,
         String,
         String,
+        f32,
         String,
         String,
     )> = conn
@@ -904,6 +909,7 @@ async fn get_graph_relationship(
               oe.entity_type,
               oe.canonical_name,
               grv.id,
+              grv.confidence,
               grv.attributes_json,
               grv.created_at
             FROM graph_relationships gr
@@ -925,6 +931,7 @@ async fn get_graph_relationship(
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
@@ -939,6 +946,7 @@ async fn get_graph_relationship(
         object_entity_type,
         object_canonical_name,
         active_version_id,
+        confidence,
         attributes_raw,
         _created_at,
     ) = row.ok_or_else(|| ApiError::not_found("graph relationship not found"))?;
@@ -960,6 +968,7 @@ async fn get_graph_relationship(
             canonical_name: object_canonical_name,
         },
         active_version_id,
+        confidence,
         attributes_json,
         evidence_record_ids,
     }))
@@ -999,7 +1008,7 @@ async fn get_graph_relationship_history(
     let mut stmt = conn
         .prepare(
             "
-            SELECT id, version_number, state, attributes_json, supersedes_version_id, valid_from, valid_to, created_at
+            SELECT id, version_number, state, confidence, attributes_json, supersedes_version_id, valid_from, valid_to, created_at
             FROM graph_relationship_versions
             WHERE relationship_id = ?1
             ORDER BY version_number DESC
@@ -1013,11 +1022,12 @@ async fn get_graph_relationship_history(
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
+                r.get::<_, f32>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })
         .map_err(|e| ApiError::internal(format!("failed to execute graph history query: {}", e)))?;
@@ -1028,6 +1038,7 @@ async fn get_graph_relationship_history(
             version_id,
             version_number,
             state,
+            confidence,
             attributes_raw,
             supersedes_version_id,
             valid_from,
@@ -1044,6 +1055,7 @@ async fn get_graph_relationship_history(
             version_id,
             version_number,
             state,
+            confidence,
             attributes_json,
             supersedes_version_id,
             valid_from,
@@ -1378,7 +1390,7 @@ fn open_db(db_path: &str) -> Result<Connection, ApiError> {
 fn load_proposal(conn: &Connection, id: &str) -> Result<ProposalRow, ApiError> {
     conn.query_row(
         "
-        SELECT id, proposal_type, subject_key, payload_json, status
+        SELECT id, proposal_type, subject_key, payload_json, confidence, status
         FROM memory_proposals
         WHERE id = ?1
         ",
@@ -1389,7 +1401,8 @@ fn load_proposal(conn: &Connection, id: &str) -> Result<ProposalRow, ApiError> {
                 proposal_type: row.get(1)?,
                 subject_key: row.get(2)?,
                 payload_json: row.get(3)?,
-                status: row.get(4)?,
+                confidence: row.get(4)?,
+                status: row.get(5)?,
             })
         },
     )
@@ -1905,6 +1918,35 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0003_knowledge_graph.sql"
     ))?;
+    apply_graph_confidence_migration(&conn)?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0004_graph_confidence.sql"
+    ))?;
+    Ok(())
+}
+
+fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(graph_relationship_versions)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut has_confidence = false;
+    for column in columns {
+        if column? == "confidence" {
+            has_confidence = true;
+            break;
+        }
+    }
+
+    if !has_confidence {
+        conn.execute(
+            "
+            ALTER TABLE graph_relationship_versions
+            ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0
+            ",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 

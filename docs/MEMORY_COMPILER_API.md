@@ -242,6 +242,11 @@ Response `201`:
 
 Commits a graph relationship proposal into versioned graph state.
 
+Behavior:
+
+- Carries proposal confidence into the committed relationship version.
+- Supersedes the previous active relationship version when present.
+
 Response `200`:
 
 ```json
@@ -267,6 +272,7 @@ Response `200`:
   "predicate": "prefers",
   "object": { "entity_type": "language", "canonical_name": "rust" },
   "active_version_id": "uuid",
+  "confidence": 0.93,
   "attributes_json": { "strength": "very_high" },
   "evidence_record_ids": ["uuid"]
 }
@@ -289,6 +295,7 @@ Response `200`:
       "version_id": "uuid",
       "version_number": 2,
       "state": "active",
+      "confidence": 0.93,
       "attributes_json": { "strength": "very_high" },
       "supersedes_version_id": "uuid",
       "valid_from": "2026-02-16T02:42:37+00:00",
