@@ -249,6 +249,41 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0003_knowledge_graph.sql"
     ))?;
+    apply_graph_confidence_migration(&conn)?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0004_graph_confidence.sql"
+    ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0005_graph_canonicalization.sql"
+    ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0006_retrieval_v2_foundation.sql"
+    ))?;
+    Ok(())
+}
+
+fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(graph_relationship_versions)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut has_confidence = false;
+    for column in columns {
+        if column? == "confidence" {
+            has_confidence = true;
+            break;
+        }
+    }
+
+    if !has_confidence {
+        conn.execute(
+            "
+            ALTER TABLE graph_relationship_versions
+            ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0
+            ",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 

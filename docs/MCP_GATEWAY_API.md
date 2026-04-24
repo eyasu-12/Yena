@@ -24,6 +24,7 @@ Supported tools for `tools/call`:
 
 - `yena.connect`
 - `yena.retrieve`
+- `yena.retrieve.v2`
 - `yena.graph.retrieve`
 - `yena.audit.list`
 - `yena.scope.upsert`
@@ -131,6 +132,109 @@ Response:
 ```
 
 Every retrieve call writes a `retrieval_audit_events` row describing scope, shared IDs, and redactions.
+
+## POST /v2/retrieve
+
+Retrieve governed developer memory using the retrieval v2 answer contract.
+
+This endpoint is the vertical-slice foundation for Yena's core memory engine. It uses a shared retrieval pipeline over active memory items, observations, and graph relationships, then returns either scoped memory answers or a calibrated abstention.
+
+Request:
+
+```json
+{
+  "agent_id": "coding-agent",
+  "query": "What database did we choose for this repo?",
+  "limit": 5,
+  "include_trace": true,
+  "scope": {
+    "kind": "repo",
+    "repo_path": "/Users/eyasu/Projects/Yena",
+    "repo_remote": "https://github.com/eyasu-12/Yena.git",
+    "branch": "main"
+  }
+}
+```
+
+Scope kinds:
+
+- `global`
+- `repo`
+- `workspace`
+- `agent`
+- `source`
+
+Response:
+
+```json
+{
+  "agent_id": "coding-agent",
+  "answer_context": {
+    "query": "What database did we choose for this repo?",
+    "scope": {
+      "kind": "repo",
+      "repo_path": "/Users/eyasu/Projects/Yena",
+      "repo_remote": "https://github.com/eyasu-12/Yena.git",
+      "branch": "main"
+    },
+    "should_abstain": false,
+    "memories": [
+      {
+        "statement": "Yena uses SQLite for local-first storage",
+        "memory_type": "project_decision",
+        "freshness": "stable",
+        "confidence": 0.91,
+        "evidence_refs": ["evidence-id"],
+        "trace": {
+          "candidate_source": "memory_item",
+          "candidate_id": "memory-id",
+          "matched_terms": ["sqlite"],
+          "score_components": {
+            "rank_score": 10.91,
+            "confidence": 0.91,
+            "freshness": "stable",
+            "evidence_count": 1
+          },
+          "scope_filter": "repo:/Users/eyasu/Projects/Yena:https://github.com/eyasu-12/Yena.git:main",
+          "redactions": [],
+          "evidence_refs": ["evidence-id"]
+        },
+        "redactions": []
+      }
+    ]
+  }
+}
+```
+
+Abstention response:
+
+```json
+{
+  "agent_id": "coding-agent",
+  "answer_context": {
+    "query": "Which auth provider did we choose?",
+    "scope": { "kind": "global" },
+    "should_abstain": true,
+    "abstention_reason": "missing_evidence",
+    "memories": []
+  }
+}
+```
+
+Abstention reasons:
+
+- `missing_evidence`
+- `stale_memory`
+- `contradicted`
+- `out_of_scope`
+- `low_confidence`
+
+Every retrieval v2 call writes:
+
+- a `retrieval_audit_events` row with `request_type = retrieve_v2`
+- a `retrieval_traces` row linked to the audit event
+
+Trace output is policy-filtered and must not contain redacted raw values.
 
 ## POST /v1/graph/retrieve
 

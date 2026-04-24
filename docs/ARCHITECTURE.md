@@ -10,8 +10,9 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 2. Evidence Store: every input becomes immutable evidence.
 3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
 4. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
-5. Policy Projection: memory is filtered by scope/sensitivity before exposure via MCP.
-6. Audit: every retrieval and redaction is logged.
+5. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
+6. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
+7. Audit: every retrieval and redaction is logged.
 
 ## Modules
 
@@ -23,6 +24,51 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 - `mcp-gateway`: retrieval and commit APIs.
 - `audit-log`: immutable access and redaction events.
 - `control-ui`: consent, retention, forget operations.
+
+## Retrieval v2 Foundation
+
+Retrieval v2 is a shared internal pipeline exposed through `POST /v2/retrieve` and MCP tool `yena.retrieve.v2`.
+
+```text
+MCP/API request
+  |
+  v
+RetrievalV2Request
+  |
+  v
+Scope resolution
+  |-- agent scopes
+  |-- repo/workspace scope
+  |-- allowed memory types
+  |
+  v
+Candidate sources
+  |-- memory_items + memory_item_versions + memory_item_metadata
+  |-- observations + observation evidence/memory links
+  |-- graph_relationships + active versions
+  |
+  v
+Rank fusion foundation
+  |-- query term matches
+  |-- confidence
+  |-- freshness
+  |-- evidence count
+  |
+  v
+Memory Answer Contract
+  |-- should_abstain
+  |-- abstention_reason
+  |-- memories
+  |-- optional trace
+  |
+  v
+Trace redaction gate
+  |
+  v
+Audit event + retrieval trace
+```
+
+The first implementation intentionally stays local-first: SQLite tables, deterministic scoring, and no required vector database.
 
 ## Non-Functional Requirements
 

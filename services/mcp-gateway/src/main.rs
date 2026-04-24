@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::info;
 use uuid::Uuid;
+use yena_model::{RetrievalScope, RetrievalScopeKind};
+
+mod retrieval_v2;
 
 #[derive(Clone)]
 struct AppState {
@@ -70,6 +73,25 @@ struct GraphRetrieveRequest {
     min_confidence: Option<f32>,
     max_hops: Option<usize>,
     rank_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrieveV2Request {
+    agent_id: String,
+    query: String,
+    limit: Option<usize>,
+    #[serde(default)]
+    include_trace: bool,
+    scope: Option<RetrieveV2ScopeRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrieveV2ScopeRequest {
+    kind: Option<String>,
+    repo_path: Option<String>,
+    repo_remote: Option<String>,
+    branch: Option<String>,
+    workspace_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +187,12 @@ struct GraphRetrieveResponse {
     agent_id: String,
     returned: usize,
     relationships: Vec<GraphRelationshipProjection>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveV2Response {
+    agent_id: String,
+    answer_context: yena_model::MemoryAnswerContract,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/policies/redact-keys", post(upsert_redact_policy))
         .route("/v1/connect", post(connect))
         .route("/v1/retrieve", post(retrieve))
+        .route("/v2/retrieve", post(retrieve_v2))
         .route("/v1/graph/retrieve", post(graph_retrieve))
         .route("/v1/audit/events/list", post(list_audit_events))
         .with_state(state);
@@ -363,6 +392,7 @@ async fn mcp_rpc(
         // Direct calls are useful for development/testing and mirror tool names.
         "yena.connect"
         | "yena.retrieve"
+        | "yena.retrieve.v2"
         | "yena.graph.retrieve"
         | "yena.audit.list"
         | "yena.scope.upsert"
@@ -395,6 +425,14 @@ async fn execute_tool_call(state: AppState, id: Value, name: &str, args: Value) 
                 state,
                 args,
                 |state, payload| async move { retrieve(State(state), Json(payload)).await },
+            )
+            .await
+        }
+        "yena.retrieve.v2" => {
+            parse_and_execute::<RetrieveV2Request, RetrieveV2Response, _, _>(
+                state,
+                args,
+                |state, payload| async move { retrieve_v2(State(state), Json(payload)).await },
             )
             .await
         }
@@ -498,6 +536,30 @@ fn mcp_tools_catalog() -> Value {
                     "agent_id": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
                     "canonical_prefix": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "yena.retrieve.v2",
+            "description": "Retrieve governed developer memory using the v2 answer contract, abstention, optional traces, and repo/workspace scope.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["agent_id", "query"],
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 },
+                    "include_trace": { "type": "boolean" },
+                    "scope": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["global", "repo", "workspace", "agent", "source"] },
+                            "repo_path": { "type": "string" },
+                            "repo_remote": { "type": "string" },
+                            "branch": { "type": "string" },
+                            "workspace_path": { "type": "string" }
+                        }
+                    }
                 }
             }
         },
@@ -837,6 +899,80 @@ async fn retrieve(
     }))
 }
 
+async fn retrieve_v2(
+    State(state): State<AppState>,
+    Json(payload): Json<RetrieveV2Request>,
+) -> Result<Json<RetrieveV2Response>, ApiError> {
+    if payload.agent_id.trim().is_empty() {
+        return Err(ApiError::bad_request("agent_id is required"));
+    }
+    if payload.query.trim().is_empty() {
+        return Err(ApiError::bad_request("query is required"));
+    }
+
+    let limit = payload.limit.unwrap_or(8).clamp(1, 50);
+    let conn = open_db(&state.db_path)?;
+    let scopes = load_scopes(&conn, &payload.agent_id)?;
+    let redaction_keys = load_redaction_keys(&conn)?;
+    let scope_names: Vec<String> = scopes.iter().map(|s| s.scope_name.clone()).collect();
+    let allowed_memory_types: BTreeSet<String> = scopes
+        .iter()
+        .flat_map(|s| s.payload.allowed_memory_types.clone())
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let requested_scope = payload
+        .scope
+        .map(scope_from_request)
+        .unwrap_or_else(retrieval_v2::global_scope);
+
+    let answer = retrieval_v2::retrieve(
+        &conn,
+        retrieval_v2::RetrievalV2Input {
+            query: payload.query,
+            limit,
+            include_trace: payload.include_trace,
+            scope: requested_scope,
+            allowed_memory_types,
+            redaction_keys,
+        },
+    )
+    .map_err(|e| ApiError::internal(format!("retrieval v2 failed: {}", e)))?;
+
+    let shared_summary = json!({
+        "should_abstain": answer.should_abstain,
+        "abstention_reason": answer.abstention_reason,
+        "memory_count": answer.memories.len(),
+        "memory_types": answer.memories.iter().map(|m| m.memory_type.clone()).collect::<Vec<_>>(),
+        "evidence_refs": answer.memories.iter().flat_map(|m| m.evidence_refs.clone()).collect::<Vec<_>>(),
+    });
+    let redacted_summary = retrieval_v2::safe_trace_summary(&answer);
+    let audit_event_id = insert_audit_event(
+        &conn,
+        "retrieve_v2",
+        &payload.agent_id,
+        &scope_names,
+        &shared_summary,
+        &redacted_summary,
+    )?;
+    insert_retrieval_trace(
+        &conn,
+        &audit_event_id,
+        &payload.agent_id,
+        &answer.query,
+        &serde_json::to_value(&answer.scope)
+            .map_err(|e| ApiError::internal(format!("failed to encode retrieval scope: {}", e)))?,
+        &serde_json::to_value(&answer)
+            .map_err(|e| ApiError::internal(format!("failed to encode answer: {}", e)))?,
+        &redacted_summary,
+    )?;
+
+    Ok(Json(RetrieveV2Response {
+        agent_id: payload.agent_id,
+        answer_context: answer,
+    }))
+}
+
 async fn graph_retrieve(
     State(state): State<AppState>,
     Json(payload): Json<GraphRetrieveRequest>,
@@ -1058,6 +1194,26 @@ fn load_scopes(conn: &Connection, agent_id: &str) -> Result<Vec<ScopeRow>, ApiEr
 
     let collected: Result<Vec<_>, _> = rows.collect();
     collected.map_err(|e| ApiError::internal(format!("failed to parse scopes: {}", e)))
+}
+
+fn scope_from_request(scope: RetrieveV2ScopeRequest) -> RetrievalScope {
+    RetrievalScope {
+        kind: scope
+            .kind
+            .as_deref()
+            .map(retrieval_v2::parse_scope_kind)
+            .unwrap_or(RetrievalScopeKind::Global),
+        repo_path: trim_optional(scope.repo_path),
+        repo_remote: trim_optional(scope.repo_remote),
+        branch: trim_optional(scope.branch),
+        workspace_path: trim_optional(scope.workspace_path),
+    }
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn load_redaction_keys(conn: &Connection) -> Result<BTreeSet<String>, ApiError> {
@@ -1508,7 +1664,8 @@ fn insert_audit_event(
     scope_names: &[String],
     shared_summary: &Value,
     redacted_summary: &Value,
-) -> Result<(), ApiError> {
+) -> Result<String, ApiError> {
+    let audit_event_id = Uuid::new_v4().to_string();
     conn.execute(
         "
         INSERT INTO retrieval_audit_events (
@@ -1516,7 +1673,7 @@ fn insert_audit_event(
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
         params![
-            Uuid::new_v4().to_string(),
+            &audit_event_id,
             agent_id,
             request_type,
             if scope_names.is_empty() {
@@ -1536,6 +1693,46 @@ fn insert_audit_event(
         ],
     )
     .map_err(|e| ApiError::internal(format!("failed to insert audit event: {}", e)))?;
+
+    Ok(audit_event_id)
+}
+
+fn insert_retrieval_trace(
+    conn: &Connection,
+    audit_event_id: &str,
+    agent_id: &str,
+    query_text: &str,
+    scope_json: &Value,
+    answer_json: &Value,
+    trace_json: &Value,
+) -> Result<(), ApiError> {
+    conn.execute(
+        "
+        INSERT INTO retrieval_traces (
+          id, audit_event_id, agent_id, query_text, scope_json, answer_json, trace_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            Uuid::new_v4().to_string(),
+            audit_event_id,
+            agent_id,
+            query_text,
+            serde_json::to_string(scope_json).map_err(|e| ApiError::internal(format!(
+                "failed to encode trace scope_json: {}",
+                e
+            )))?,
+            serde_json::to_string(answer_json).map_err(|e| ApiError::internal(format!(
+                "failed to encode trace answer_json: {}",
+                e
+            )))?,
+            serde_json::to_string(trace_json).map_err(|e| ApiError::internal(format!(
+                "failed to encode trace trace_json: {}",
+                e
+            )))?,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert retrieval trace: {}", e)))?;
 
     Ok(())
 }
@@ -1562,6 +1759,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     ))?;
     conn.execute_batch(include_str!(
         "../../../db/migrations/0005_graph_canonicalization.sql"
+    ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0006_retrieval_v2_foundation.sql"
     ))?;
     Ok(())
 }

@@ -15,6 +15,47 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 
 ## Decision Log
 
+### 2026-04-24
+
+- Implemented retrieval v2 vertical slice foundation:
+  - `db/migrations/0006_retrieval_v2_foundation.sql`
+  - `memory_item_metadata`
+  - `observations`
+  - `observation_memory_links`
+  - `observation_evidence_links`
+  - `retrieval_traces`
+  - `retrieval_documents_fts`
+- Added first-class retrieval answer contract types to `crates/yena-model`:
+  - `RetrievalScope`
+  - `RetrievalScopeKind`
+  - `MemoryFreshness`
+  - `AbstentionReason`
+  - `RetrievalTrace`
+  - `MemoryAnswer`
+  - `MemoryAnswerContract`
+- Added shared retrieval v2 pipeline skeleton in `mcp-gateway`:
+  - candidate sources for active memory items, observations, and graph relationships
+  - repo/workspace-aware scope filtering
+  - deterministic rank foundation using query matches, confidence, freshness, and evidence count
+  - calibrated abstention for missing evidence, out-of-scope, stale, contradicted, and low-confidence cases
+  - optional trace output with redaction-safe fields only
+- Exposed retrieval v2 through:
+  - `POST /v2/retrieve`
+  - MCP tool `yena.retrieve.v2`
+- Added retrieval v2 audit/trace persistence:
+  - `retrieval_audit_events.request_type = retrieve_v2`
+  - linked `retrieval_traces` row per retrieval v2 call
+- Added developer-memory benchmark seed artifact:
+  - `benchmarks/developer_memory_seed.json`
+  - `benchmarks/README.md`
+- Created ongoing backlog file:
+  - `TODOS.md`
+  - deferred `AGENTS.md` / `CLAUDE.md` import until after retrieval v2 proves value
+- Updated docs:
+  - `docs/ARCHITECTURE.md`
+  - `docs/MCP_GATEWAY_API.md`
+- Verified with `cargo fmt` and `cargo test`.
+
 ### 2026-04-23
 
 - Added graph confidence persistence migration:
@@ -186,6 +227,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, ranking heuristics, canonicalization rules, and compaction complete; broader reasoning and graph semantics still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
+- [~] Retrieval v2 foundation implemented (answer contract, repo/workspace scope schema, observations schema, trace persistence, abstention behavior, benchmark seeds, and shared retrieval pipeline skeleton complete; full FTS/BM25 rank fusion and observation compiler still pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

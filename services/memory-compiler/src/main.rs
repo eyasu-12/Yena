@@ -441,6 +441,19 @@ struct GraphRelationshipVersionEntry {
     evidence_record_ids: Vec<String>,
 }
 
+type GraphRelationshipViewRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    f32,
+    String,
+    String,
+);
+
 #[derive(Debug, Clone)]
 struct GraphCompactionCandidate {
     relationship_id: String,
@@ -1239,18 +1252,7 @@ async fn get_graph_relationship(
 ) -> Result<Json<GraphRelationshipViewResponse>, ApiError> {
     let conn = open_db(&state.db_path)?;
 
-    let row: Option<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        f32,
-        String,
-        String,
-    )> = conn
+    let row: Option<GraphRelationshipViewRow> = conn
         .query_row(
             "
             SELECT
@@ -2851,6 +2853,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0005_graph_canonicalization.sql"
     ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0006_retrieval_v2_foundation.sql"
+    ))?;
     Ok(())
 }
 
@@ -3089,6 +3094,10 @@ mod tests {
             "../../../db/migrations/0005_graph_canonicalization.sql"
         ))
         .expect("graph canonicalization migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0006_retrieval_v2_foundation.sql"
+        ))
+        .expect("retrieval v2 foundation migration should apply");
         conn
     }
 
@@ -3123,6 +3132,7 @@ mod tests {
         .expect("evidence should insert");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_relationship_with_active_version(
         conn: &Connection,
         relationship_id: &str,

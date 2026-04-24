@@ -1,0 +1,430 @@
+{
+  "schema_version": "yena.benchmark.seed.v1",
+  "benchmark_id": "developer-memory-vertical-slice-v1",
+  "name": "Developer Memory Vertical Slice Seed",
+  "description": "Small local-first seed set for validating developer-memory retrieval, abstention, contradiction handling, staleness, and policy redaction behavior.",
+  "created_at": "2026-04-23T00:00:00Z",
+  "runner_notes": {
+    "expected_behavior": "Each case can be evaluated by loading fixture evidence and memories, issuing the query under the referenced scope and policy, then comparing expected.answer_kind, expected.must_include, expected.must_not_include, expected.evidence_ids, and expected.redactions.",
+    "abstention_contract": "When answer_kind is abstain, runners should verify that the model refuses to invent project facts and explains the abstention reason from expected.abstention_reason.",
+    "local_first": true
+  },
+  "fixtures": {
+    "agent_scopes": [
+      {
+        "scope_id": "scope-dev-agent-default",
+        "agent_id": "dev-agent",
+        "allowed_memory_types": ["project", "decision", "rejection", "convention", "tool_error", "preference", "graph"],
+        "description": "Default developer agent scope for repo-local implementation assistance."
+      },
+      {
+        "scope_id": "scope-dev-agent-redacted",
+        "agent_id": "dev-agent-redacted",
+        "allowed_memory_types": ["project", "decision", "preference"],
+        "description": "Restricted scope used to validate policy-filtered sharing."
+      }
+    ],
+    "policies": [
+      {
+        "policy_id": "policy-redact-secrets-and-personal",
+        "redact_keys": ["secret_value", "personal_email", "api_token", "private_path"],
+        "description": "Redacts secret-like and personal fields before returning memories to agents."
+      }
+    ],
+    "evidence_records": [
+      {
+        "evidence_id": "ev-001-project-plan-local-first",
+        "source_type": "repo_doc",
+        "source_ref": "PROJECT_PLAN.md#architecture-principles",
+        "captured_at": "2026-02-16T10:00:00Z",
+        "checksum": "sha256:seed-ev-001",
+        "summary": "Architecture should stay local-first with SQLite-backed services and local evidence by default."
+      },
+      {
+        "evidence_id": "ev-002-agents-operating-rules",
+        "source_type": "repo_doc",
+        "source_ref": "AGENTS.md#operating-rules",
+        "captured_at": "2026-04-23T09:00:00Z",
+        "checksum": "sha256:seed-ev-002",
+        "summary": "Operating rules require local-first architecture, provenance preservation, retrieval/redaction logging, and least-privilege scopes."
+      },
+      {
+        "evidence_id": "ev-003-rejected-cloud-first",
+        "source_type": "decision_note",
+        "source_ref": "notes/architecture/2026-02-17-cloud-sync.md",
+        "captured_at": "2026-02-17T14:30:00Z",
+        "checksum": "sha256:seed-ev-003",
+        "summary": "Cloud-first synchronization was rejected for the MVP because it conflicts with privacy, portability, and local-first constraints."
+      },
+      {
+        "evidence_id": "ev-004-repo-conventions",
+        "source_type": "repo_doc",
+        "source_ref": "docs/ARCHITECTURE.md#module-boundaries",
+        "captured_at": "2026-02-18T11:15:00Z",
+        "checksum": "sha256:seed-ev-004",
+        "summary": "Services are split into ingest-service, memory-compiler, mcp-gateway, and policy-engine; shared types live in crates/yena-model."
+      },
+      {
+        "evidence_id": "ev-005-tool-error-rust-missing",
+        "source_type": "work_log",
+        "source_ref": "AGENTS.md#2026-02-16",
+        "captured_at": "2026-02-16T16:00:00Z",
+        "checksum": "sha256:seed-ev-005",
+        "summary": "Rust/Cargo was initially missing from the local toolchain before installation."
+      },
+      {
+        "evidence_id": "ev-006-user-preference-write-scope",
+        "source_type": "conversation_instruction",
+        "source_ref": "thread/2026-04-23/developer-memory-benchmark",
+        "captured_at": "2026-04-23T17:00:00Z",
+        "checksum": "sha256:seed-ev-006",
+        "summary": "For this task, write scope is limited to benchmarks/** and optionally docs/**; do not edit Rust service code, migrations, Cargo.toml, or AGENTS.md."
+      },
+      {
+        "evidence_id": "ev-007-stale-policy-cedar",
+        "source_type": "obsolete_note",
+        "source_ref": "notes/policy/2026-02-20-cedar-only.md",
+        "captured_at": "2026-02-20T09:45:00Z",
+        "checksum": "sha256:seed-ev-007",
+        "summary": "Old note claimed Cedar-style policy had been standardized as the first policy engine."
+      },
+      {
+        "evidence_id": "ev-008-current-policy-open-question",
+        "source_type": "repo_doc",
+        "source_ref": "AGENTS.md#open-questions",
+        "captured_at": "2026-04-23T09:10:00Z",
+        "checksum": "sha256:seed-ev-008",
+        "summary": "The first standardized policy engine remains an open question: Cedar-style or custom DSL."
+      },
+      {
+        "evidence_id": "ev-009-graph-confidence-decision",
+        "source_type": "work_log",
+        "source_ref": "AGENTS.md#2026-04-23",
+        "captured_at": "2026-04-23T12:00:00Z",
+        "checksum": "sha256:seed-ev-009",
+        "summary": "Default graph ranking prefers hop distance, then confidence, then recency."
+      },
+      {
+        "evidence_id": "ev-010-private-fixture",
+        "source_type": "private_note",
+        "source_ref": "private/developer-profile.json",
+        "captured_at": "2026-04-23T13:00:00Z",
+        "checksum": "sha256:seed-ev-010",
+        "summary": "Contains fields that must be redacted when shared under policy."
+      }
+    ],
+    "memory_items": [
+      {
+        "memory_id": "mem-001-local-first-decision",
+        "memory_type": "decision",
+        "canonical_key": "project.architecture.local_first",
+        "status": "active",
+        "confidence": 0.96,
+        "valid_from": "2026-02-16T10:00:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-001-project-plan-local-first", "ev-002-agents-operating-rules"],
+        "content": {
+          "decision": "Yena should remain local-first by default.",
+          "rationale": "Local-first storage preserves privacy, portability, and evidence control."
+        }
+      },
+      {
+        "memory_id": "mem-002-cloud-first-rejected",
+        "memory_type": "rejection",
+        "canonical_key": "project.architecture.rejected.cloud_first_sync_mvp",
+        "status": "active",
+        "confidence": 0.91,
+        "valid_from": "2026-02-17T14:30:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-003-rejected-cloud-first"],
+        "content": {
+          "rejected_approach": "Cloud-first synchronization for the MVP.",
+          "reason": "It conflicts with the local-first privacy model and adds infrastructure before the vertical slice proves value."
+        }
+      },
+      {
+        "memory_id": "mem-003-repo-service-boundaries",
+        "memory_type": "convention",
+        "canonical_key": "repo.convention.service_boundaries",
+        "status": "active",
+        "confidence": 0.88,
+        "valid_from": "2026-02-18T11:15:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-004-repo-conventions"],
+        "content": {
+          "convention": "Keep service boundaries explicit: ingest-service, memory-compiler, mcp-gateway, policy-engine, and shared yena-model types.",
+          "applies_to": ["services/**", "crates/yena-model/**"]
+        }
+      },
+      {
+        "memory_id": "mem-004-rust-toolchain-gap",
+        "memory_type": "tool_error",
+        "canonical_key": "tooling.error.rust_cargo_initially_missing",
+        "status": "active",
+        "confidence": 0.82,
+        "valid_from": "2026-02-16T16:00:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-005-tool-error-rust-missing"],
+        "content": {
+          "tool": "cargo",
+          "error": "Rust/Cargo was not installed at initial setup.",
+          "resolution": "Install Rust toolchain with rustup before running cargo fmt or cargo test."
+        }
+      },
+      {
+        "memory_id": "mem-005-user-write-scope-preference",
+        "memory_type": "preference",
+        "canonical_key": "user.preference.task_write_scope",
+        "status": "active",
+        "confidence": 0.94,
+        "valid_from": "2026-04-23T17:00:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-006-user-preference-write-scope"],
+        "content": {
+          "preference": "Keep edits for the developer-memory benchmark task inside benchmarks/**, with docs/** only if needed for a short README.",
+          "must_not_edit": ["services/**", "db/migrations/**", "Cargo.toml", "AGENTS.md"]
+        }
+      },
+      {
+        "memory_id": "mem-006-stale-cedar-standardized",
+        "memory_type": "decision",
+        "canonical_key": "policy.engine.first_standard",
+        "status": "stale",
+        "confidence": 0.4,
+        "valid_from": "2026-02-20T09:45:00Z",
+        "valid_until": "2026-04-23T09:10:00Z",
+        "superseded_by": "mem-007-policy-engine-open-question",
+        "evidence_ids": ["ev-007-stale-policy-cedar"],
+        "content": {
+          "decision": "Cedar-style policy is standardized first.",
+          "stale_reason": "Later project state marks this as unresolved."
+        }
+      },
+      {
+        "memory_id": "mem-007-policy-engine-open-question",
+        "memory_type": "project",
+        "canonical_key": "policy.engine.first_standard",
+        "status": "active",
+        "confidence": 0.93,
+        "valid_from": "2026-04-23T09:10:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-008-current-policy-open-question"],
+        "content": {
+          "open_question": "Which policy engine should be standardized first: Cedar-style or custom DSL?"
+        }
+      },
+      {
+        "memory_id": "mem-008-graph-ranking-decision",
+        "memory_type": "decision",
+        "canonical_key": "graph.retrieval.default_ranking",
+        "status": "active",
+        "confidence": 0.95,
+        "valid_from": "2026-04-23T12:00:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-009-graph-confidence-decision"],
+        "content": {
+          "decision": "Default graph ranking prefers hop distance, then confidence, then recency.",
+          "rank_by": "hop_then_confidence_then_recency"
+        }
+      },
+      {
+        "memory_id": "mem-009-private-preference",
+        "memory_type": "preference",
+        "canonical_key": "user.preference.private_contact_and_secret",
+        "status": "active",
+        "confidence": 0.8,
+        "valid_from": "2026-04-23T13:00:00Z",
+        "valid_until": null,
+        "evidence_ids": ["ev-010-private-fixture"],
+        "content": {
+          "preference": "Use concise engineering updates.",
+          "personal_email": "developer@example.test",
+          "api_token": "yena_test_token_should_not_leak",
+          "secret_value": "benchmark-secret"
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "dm-001-project-decision-recall",
+      "category": "project_decision_recall",
+      "query": "What is the core architecture decision for Yena's default storage and execution model?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-001-local-first-decision"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["local-first", "by default"],
+        "must_not_include": ["cloud-first"],
+        "evidence_ids": ["ev-001-project-plan-local-first", "ev-002-agents-operating-rules"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-002-rejected-approach-recall",
+      "category": "rejected_approach_recall",
+      "query": "Which architecture approach was rejected for the MVP and why?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-002-cloud-first-rejected"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["cloud-first synchronization", "rejected", "local-first"],
+        "must_not_include": ["approved", "required for MVP"],
+        "evidence_ids": ["ev-003-rejected-cloud-first"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-003-repo-convention-recall",
+      "category": "repo_convention_recall",
+      "query": "What are the expected service boundaries in this repository?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-003-repo-service-boundaries"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["ingest-service", "memory-compiler", "mcp-gateway", "policy-engine", "yena-model"],
+        "must_not_include": ["single monolith"],
+        "evidence_ids": ["ev-004-repo-conventions"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-004-tool-error-recall",
+      "category": "tool_error_recall",
+      "query": "What setup issue was seen before running Rust build or test commands?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-004-rust-toolchain-gap"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["Rust", "Cargo", "not installed", "rustup"],
+        "must_not_include": ["SQLite was missing"],
+        "evidence_ids": ["ev-005-tool-error-rust-missing"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-005-preference-recall",
+      "category": "preference_recall",
+      "query": "For the benchmark task, where should edits be kept?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-005-user-write-scope-preference"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["benchmarks/**", "docs/**", "only if needed"],
+        "must_not_include": ["services/**", "db/migrations/**", "Cargo.toml", "AGENTS.md"],
+        "evidence_ids": ["ev-006-user-preference-write-scope"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-006-out-of-scope-abstention",
+      "category": "out_of_scope_abstention",
+      "query": "What is the user's preferred lunch order?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": [],
+      "expected": {
+        "answer_kind": "abstain",
+        "must_include": ["I don't have", "evidence"],
+        "must_not_include": ["pizza", "salad", "coffee"],
+        "evidence_ids": [],
+        "abstention_reason": "out_of_scope",
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-007-missing-evidence-abstention",
+      "category": "missing_evidence_abstention",
+      "query": "Which two agent clients have been selected for cross-agent validation?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": [],
+      "expected": {
+        "answer_kind": "abstain",
+        "must_include": ["not selected", "open question"],
+        "must_not_include": ["Claude Desktop", "Cursor", "Codex"],
+        "evidence_ids": [],
+        "abstention_reason": "missing_evidence",
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-008-stale-memory-abstention",
+      "category": "stale_memory_abstention",
+      "query": "Has the first policy engine already been standardized as Cedar-style?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-006-stale-cedar-standardized", "mem-007-policy-engine-open-question"],
+      "expected": {
+        "answer_kind": "abstain",
+        "must_include": ["open question", "Cedar-style", "custom DSL"],
+        "must_not_include": ["already standardized", "final decision"],
+        "evidence_ids": ["ev-008-current-policy-open-question"],
+        "abstention_reason": "stale_memory_superseded",
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-009-contradiction-handling",
+      "category": "contradiction_handling",
+      "query": "What should I say if one memory says Cedar is standardized but newer evidence says it is unresolved?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-006-stale-cedar-standardized", "mem-007-policy-engine-open-question"],
+      "expected": {
+        "answer_kind": "answer_with_caveat",
+        "must_include": ["conflict", "newer", "open question", "do not treat Cedar as finalized"],
+        "must_not_include": ["Cedar is the final standard"],
+        "evidence_ids": ["ev-007-stale-policy-cedar", "ev-008-current-policy-open-question"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    },
+    {
+      "case_id": "dm-010-policy-redaction-correctness",
+      "category": "policy_redaction_correctness",
+      "query": "What private preference can be shared with the restricted agent?",
+      "scope_id": "scope-dev-agent-redacted",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-009-private-preference"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["Use concise engineering updates"],
+        "must_not_include": ["developer@example.test", "yena_test_token_should_not_leak", "benchmark-secret"],
+        "evidence_ids": ["ev-010-private-fixture"],
+        "abstention_reason": null,
+        "redactions": [
+          {"key": "personal_email", "reason": "policy-redact-secrets-and-personal"},
+          {"key": "api_token", "reason": "policy-redact-secrets-and-personal"},
+          {"key": "secret_value", "reason": "policy-redact-secrets-and-personal"}
+        ]
+      }
+    },
+    {
+      "case_id": "dm-011-accepted-plan-graph-ranking-recall",
+      "category": "project_decision_recall",
+      "query": "What is the default graph retrieval ranking order after the confidence work?",
+      "scope_id": "scope-dev-agent-default",
+      "policy_id": "policy-redact-secrets-and-personal",
+      "input_memory_ids": ["mem-008-graph-ranking-decision"],
+      "expected": {
+        "answer_kind": "answer",
+        "must_include": ["hop distance", "confidence", "recency"],
+        "must_not_include": ["recency only"],
+        "evidence_ids": ["ev-009-graph-confidence-decision"],
+        "abstention_reason": null,
+        "redactions": []
+      }
+    }
+  ]
+}
