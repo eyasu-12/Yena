@@ -36,7 +36,7 @@ def main() -> int:
     print(
         "Loaded {evidence} evidence records, {scopes} agent scopes, "
         "{policies} policies, {memory_items} memory items, {versions} versions, "
-        "and {fts_documents} retrieval documents into {db}".format(
+        "{observations} observations, and {fts_documents} retrieval documents into {db}".format(
             **counts,
             db=args.db,
         )
@@ -219,6 +219,7 @@ def load_memories(
     memory_item_count = 0
     version_count = 0
     fts_count = 0
+    observation_count = 0
     for canonical_key, versions in grouped.items():
         ordered_versions = sorted(versions, key=lambda item: item.get("valid_from") or "")
         active_memory = next(
@@ -292,11 +293,14 @@ def load_memories(
 
         upsert_memory_metadata(conn, memory_item_id, active_memory, scope, updated_at)
         upsert_fts_document(conn, memory_item_id, canonical_key, active_memory, evidence_by_id, scope)
-        fts_count += 1
+        upsert_observation(conn, memory_item_id, canonical_key, active_memory, evidence_by_id, scope)
+        observation_count += 1
+        fts_count += 2
 
     return {
         "memory_items": memory_item_count,
         "versions": version_count,
+        "observations": observation_count,
         "fts_documents": fts_count,
     }
 
@@ -366,6 +370,113 @@ def upsert_fts_document(
             scope["branch"],
             canonical_key,
             " ".join(body_parts),
+        ),
+    )
+
+
+def upsert_observation(
+    conn: sqlite3.Connection,
+    memory_item_id: str,
+    canonical_key: str,
+    memory: dict[str, Any],
+    evidence_by_id: dict[str, dict[str, Any]],
+    scope: dict[str, str | None],
+) -> None:
+    observation_id = f"observation-{memory_item_id}"
+    statement = statement_for(memory)
+    evidence_ids = memory.get("evidence_ids", [])
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO observations (
+          id, observation_type, statement, scope_kind, repo_path, repo_remote, branch,
+          workspace_path, proof_count, confidence, freshness, contradiction_count,
+          last_verified_at, valid_from, valid_to, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, 'active', ?, ?)
+        """,
+        (
+            observation_id,
+            require(memory, "memory_type"),
+            statement,
+            scope["scope_kind"],
+            scope["repo_path"],
+            scope["repo_remote"],
+            scope["branch"],
+            scope["workspace_path"],
+            len(evidence_ids),
+            float(memory.get("confidence", 1.0)),
+            freshness_for(memory),
+            memory.get("valid_from") or NOW,
+            memory.get("valid_from") or NOW,
+            memory.get("valid_from") or NOW,
+            memory.get("valid_from") or NOW,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM observation_memory_links WHERE observation_id = ?",
+        (observation_id,),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO observation_memory_links (
+          id, observation_id, memory_item_id, link_type, created_at
+        ) VALUES (?, ?, ?, 'compiled_from_memory', ?)
+        """,
+        (
+            f"observation-memory-link-{memory_item_id}",
+            observation_id,
+            memory_item_id,
+            memory.get("valid_from") or NOW,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM observation_evidence_links WHERE observation_id = ?",
+        (observation_id,),
+    )
+    for evidence_id in evidence_ids:
+        if evidence_id not in evidence_by_id:
+            raise SystemExit(
+                f"Memory {memory.get('memory_id')} references unknown evidence {evidence_id}"
+            )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO observation_evidence_links (
+              id, observation_id, evidence_record_id, link_type, created_at
+            ) VALUES (?, ?, ?, 'supporting_evidence', ?)
+            """,
+            (
+                f"observation-evidence-link-{memory_item_id}-{evidence_id}",
+                observation_id,
+                evidence_id,
+                memory.get("valid_from") or NOW,
+            ),
+        )
+
+    body = " ".join(
+        [
+            require(memory, "memory_type"),
+            canonical_key,
+            statement,
+            json.dumps(memory_value(memory), sort_keys=True),
+        ]
+    )
+    conn.execute(
+        "DELETE FROM retrieval_documents_fts WHERE source_type = ? AND source_id = ?",
+        ("observation", observation_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO retrieval_documents_fts (
+          source_type, source_id, scope_kind, repo_path, repo_remote, branch, title, body
+        ) VALUES ('observation', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            observation_id,
+            scope["scope_kind"],
+            scope["repo_path"],
+            scope["repo_remote"],
+            scope["branch"],
+            canonical_key,
+            body,
         ),
     )
 

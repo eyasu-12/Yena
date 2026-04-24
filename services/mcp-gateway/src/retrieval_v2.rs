@@ -84,6 +84,7 @@ pub(crate) fn retrieve(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.candidate.updated_at.cmp(&a.candidate.updated_at))
     });
+    dedupe_ranked_candidates(&mut scoped);
     retain_top_relevance_band(&mut scoped);
 
     if scoped
@@ -565,6 +566,52 @@ fn retain_top_relevance_band(scored: &mut Vec<RankedCandidate>) {
     };
     let threshold = top_score * 0.65;
     scored.retain(|ranked| ranked.score >= threshold);
+}
+
+fn dedupe_ranked_candidates(scored: &mut Vec<RankedCandidate>) {
+    let mut selected: Vec<RankedCandidate> = Vec::new();
+    for ranked in std::mem::take(scored) {
+        let key = dedupe_key(&ranked);
+        if let Some(existing_index) = selected
+            .iter()
+            .position(|existing| dedupe_key(existing) == key)
+        {
+            if candidate_source_priority(&ranked.candidate.source)
+                > candidate_source_priority(&selected[existing_index].candidate.source)
+            {
+                selected[existing_index] = ranked;
+            }
+        } else {
+            selected.push(ranked);
+        }
+    }
+    selected.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                candidate_source_priority(&b.candidate.source)
+                    .cmp(&candidate_source_priority(&a.candidate.source))
+            })
+    });
+    *scored = selected;
+}
+
+fn dedupe_key(ranked: &RankedCandidate) -> String {
+    format!(
+        "{}:{}",
+        ranked.candidate.memory_type,
+        ranked.candidate.statement.to_lowercase()
+    )
+}
+
+fn candidate_source_priority(source: &str) -> usize {
+    match source {
+        "memory_item" => 3,
+        "observation" => 2,
+        "graph_relationship" => 1,
+        _ => 0,
+    }
 }
 
 fn optional_eq(requested: &Option<String>, candidate: &Option<String>) -> bool {

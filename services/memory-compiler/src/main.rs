@@ -809,6 +809,18 @@ async fn commit_proposal(
         &payload.value_json,
         payload.scope.as_ref(),
     )?;
+    upsert_observation_for_memory(
+        &tx,
+        &memory_item_id,
+        &proposal.subject_key,
+        &payload.memory_type,
+        &payload.value_json,
+        &payload.evidence_record_ids,
+        payload.scope.as_ref(),
+        payload.freshness.as_deref(),
+        proposal.confidence,
+        &committed_at,
+    )?;
 
     tx.execute(
         "
@@ -918,6 +930,164 @@ fn upsert_memory_fts_document(
         canonical_key,
         &body,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_observation_for_memory(
+    tx: &Transaction<'_>,
+    memory_item_id: &str,
+    canonical_key: &str,
+    memory_type: &str,
+    value_json: &Value,
+    evidence_record_ids: &[String],
+    scope: Option<&MemoryScopePayload>,
+    freshness: Option<&str>,
+    confidence: f32,
+    updated_at: &str,
+) -> Result<(), ApiError> {
+    let observation_id = observation_id_for_memory(memory_item_id);
+    let statement = statement_from_memory_value(canonical_key, value_json);
+    let scope_kind = scope
+        .and_then(|s| s.kind.as_deref())
+        .map(normalize_scope_kind)
+        .unwrap_or_else(|| "global".to_string());
+    let freshness = freshness
+        .map(normalize_freshness)
+        .unwrap_or_else(|| "stable".to_string());
+    let repo_path = scope.and_then(|s| trim_scope_field(s.repo_path.as_deref()));
+    let repo_remote = scope.and_then(|s| trim_scope_field(s.repo_remote.as_deref()));
+    let branch = scope.and_then(|s| trim_scope_field(s.branch.as_deref()));
+    let workspace_path = scope.and_then(|s| trim_scope_field(s.workspace_path.as_deref()));
+    let proof_count = evidence_record_ids.len() as i64;
+
+    tx.execute(
+        "
+        INSERT INTO observations (
+          id, observation_type, statement, scope_kind, repo_path, repo_remote, branch,
+          workspace_path, proof_count, confidence, freshness, contradiction_count,
+          last_verified_at, valid_from, valid_to, status, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?12, NULL, 'active', ?12, ?12)
+        ON CONFLICT(id) DO UPDATE SET
+          observation_type = excluded.observation_type,
+          statement = excluded.statement,
+          scope_kind = excluded.scope_kind,
+          repo_path = excluded.repo_path,
+          repo_remote = excluded.repo_remote,
+          branch = excluded.branch,
+          workspace_path = excluded.workspace_path,
+          proof_count = excluded.proof_count,
+          confidence = excluded.confidence,
+          freshness = excluded.freshness,
+          contradiction_count = excluded.contradiction_count,
+          last_verified_at = excluded.last_verified_at,
+          valid_to = NULL,
+          status = 'active',
+          updated_at = excluded.updated_at
+        ",
+        params![
+            &observation_id,
+            memory_type,
+            &statement,
+            scope_kind,
+            repo_path,
+            repo_remote,
+            branch,
+            workspace_path,
+            proof_count,
+            confidence,
+            freshness,
+            updated_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to upsert observation: {}", e)))?;
+
+    tx.execute(
+        "DELETE FROM observation_memory_links WHERE observation_id = ?1",
+        params![&observation_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to clear observation memory links: {}", e)))?;
+    tx.execute(
+        "
+        INSERT INTO observation_memory_links (
+          id, observation_id, memory_item_id, link_type, created_at
+        ) VALUES (?1, ?2, ?3, 'compiled_from_memory', ?4)
+        ",
+        params![
+            format!("observation-memory-link-{}", memory_item_id),
+            &observation_id,
+            memory_item_id,
+            updated_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to link observation memory: {}", e)))?;
+
+    tx.execute(
+        "DELETE FROM observation_evidence_links WHERE observation_id = ?1",
+        params![&observation_id],
+    )
+    .map_err(|e| {
+        ApiError::internal(format!("failed to clear observation evidence links: {}", e))
+    })?;
+    for evidence_id in evidence_record_ids {
+        tx.execute(
+            "
+            INSERT INTO observation_evidence_links (
+              id, observation_id, evidence_record_id, link_type, created_at
+            ) VALUES (?1, ?2, ?3, 'supporting_evidence', ?4)
+            ",
+            params![
+                format!(
+                    "observation-evidence-link-{}-{}",
+                    memory_item_id, evidence_id
+                ),
+                &observation_id,
+                evidence_id,
+                updated_at,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to link observation evidence: {}", e)))?;
+    }
+
+    let body = format!(
+        "{} {} {}",
+        memory_type,
+        canonical_key,
+        serde_json::to_string(value_json).map_err(|e| ApiError::internal(format!(
+            "failed to encode observation FTS body: {}",
+            e
+        )))?
+    );
+    upsert_retrieval_document(
+        tx,
+        "observation",
+        &observation_id,
+        &scope_kind,
+        repo_path.as_deref(),
+        repo_remote.as_deref(),
+        branch.as_deref(),
+        canonical_key,
+        &format!("{} {}", statement, body),
+    )?;
+
+    Ok(())
+}
+
+fn observation_id_for_memory(memory_item_id: &str) -> String {
+    format!("observation-{}", memory_item_id)
+}
+
+fn statement_from_memory_value(canonical_key: &str, value_json: &Value) -> String {
+    value_json
+        .get("statement")
+        .and_then(Value::as_str)
+        .or_else(|| value_json.get("value").and_then(Value::as_str))
+        .or_else(|| value_json.get("decision").and_then(Value::as_str))
+        .or_else(|| value_json.get("preference").and_then(Value::as_str))
+        .or_else(|| value_json.get("convention").and_then(Value::as_str))
+        .or_else(|| value_json.get("open_question").and_then(Value::as_str))
+        .or_else(|| value_json.get("error").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{} {}", canonical_key, value_json))
 }
 
 fn upsert_graph_fts_document(
@@ -3125,7 +3295,8 @@ mod tests {
 
     use super::{
         apply_graph_confidence_migration, compact_graph_relationships, ensure_graph_entity,
-        ensure_graph_entity_without_alias, CreateProposalRequest, GraphEntityRef,
+        ensure_graph_entity_without_alias, upsert_observation_for_memory, CreateProposalRequest,
+        GraphEntityRef,
     };
 
     #[test]
@@ -3142,6 +3313,81 @@ mod tests {
         };
 
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn memory_commit_observation_compiler_upserts_observation_links_and_fts() {
+        let mut conn = test_conn();
+        let now = "2026-04-24T12:00:00+00:00";
+        insert_evidence(&conn, "evidence-observation", now);
+        conn.execute(
+            "
+            INSERT INTO memory_items (
+              id, memory_type, canonical_key, active_version_id, status, created_at, updated_at
+            ) VALUES ('memory-observation', 'decision', 'project.storage', NULL, 'active', ?1, ?1)
+            ",
+            params![now],
+        )
+        .expect("memory item should insert");
+
+        let tx = conn.transaction().expect("transaction should start");
+        upsert_observation_for_memory(
+            &tx,
+            "memory-observation",
+            "project.storage",
+            "decision",
+            &json!({"decision":"Yena uses SQLite for local-first storage."}),
+            &["evidence-observation".to_string()],
+            None,
+            Some("stable"),
+            0.92,
+            now,
+        )
+        .expect("observation should compile");
+        tx.commit().expect("transaction should commit");
+
+        let (statement, proof_count, confidence): (String, i64, f32) = conn
+            .query_row(
+                "
+                SELECT statement, proof_count, confidence
+                FROM observations
+                WHERE id = 'observation-memory-observation'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("observation should be queryable");
+        assert_eq!(statement, "Yena uses SQLite for local-first storage.");
+        assert_eq!(proof_count, 1);
+        assert_eq!(confidence, 0.92);
+
+        let evidence_link_count: i64 = conn
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM observation_evidence_links
+                WHERE observation_id = 'observation-memory-observation'
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .expect("evidence link count should be queryable");
+        assert_eq!(evidence_link_count, 1);
+
+        let fts_count: i64 = conn
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM retrieval_documents_fts
+                WHERE source_type = 'observation'
+                  AND source_id = 'observation-memory-observation'
+                  AND retrieval_documents_fts MATCH 'sqlite'
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .expect("observation FTS document should be queryable");
+        assert_eq!(fts_count, 1);
     }
 
     #[test]

@@ -44,12 +44,14 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `POST /v1/proposals` accepts optional scope and freshness metadata
   - committed memories upsert `memory_item_metadata`
   - committed memories and graph relationships upsert local `retrieval_documents_fts` documents
+  - committed memories compile/update linked `observations` rows with memory links, evidence links, and observation FTS documents
 - Extended retrieval v2 scoring:
   - loads local SQLite FTS scores from `retrieval_documents_fts`
   - can retrieve concise memory answers through richer indexed documents
   - abstains when matching candidates have no evidence references
   - filters stopwords and weak FTS-only matches to reduce irrelevant memory leakage
   - retains only the top relevance band before projection
+  - deduplicates identical memory/observation candidates while preferring memory items for redaction-sensitive payloads
   - handles stale/superseded decision abstention with current supporting evidence
   - handles conflict-style prompts with a caveated current-memory answer
 - Exposed retrieval v2 through:
@@ -64,6 +66,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - Added developer-memory benchmark runner:
   - `benchmarks/load_developer_memory_seed.py`
   - `benchmarks/run_developer_memory_benchmark.py`
+  - fixture loader now creates compiled observations and observation FTS documents
   - validates answer kind, inclusions/exclusions, evidence IDs, redactions, and abstention reason against `/v2/retrieve`
 - Created ongoing backlog file:
   - `TODOS.md`
@@ -72,7 +75,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `docs/ARCHITECTURE.md`
   - `docs/MCP_GATEWAY_API.md`
   - `docs/MEMORY_COMPILER_API.md`
-- Verified with `cargo fmt`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, benchmark fixture loading, 11/11 developer-memory benchmark validation, and a live compiler-to-gateway FTS smoke test.
+- Verified with `cargo fmt`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, benchmark fixture loading with observations, 11/11 developer-memory benchmark validation, and a live compiler-to-gateway FTS smoke test.
 
 ### 2026-04-23
 
@@ -245,7 +248,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, ranking heuristics, canonicalization rules, and compaction complete; broader reasoning and graph semantics still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
-- [~] Retrieval v2 foundation implemented (answer contract, repo/workspace scope schema, observations schema, trace persistence, abstention behavior, benchmark seeds/loader/runner, local FTS indexing, FTS-aware rank fusion, stale/superseded handling, and 11/11 developer-memory benchmark pass complete; observation compiler still pending)
+- [~] Retrieval v2 foundation implemented (answer contract, repo/workspace scope schema, observations schema/compiler, trace persistence, abstention behavior, benchmark seeds/loader/runner, local FTS indexing, FTS-aware rank fusion, stale/superseded handling, and 11/11 developer-memory benchmark pass complete; richer observation semantics still pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 

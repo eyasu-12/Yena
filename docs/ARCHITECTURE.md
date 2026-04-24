@@ -9,11 +9,12 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
 3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
-4. Retrieval Indexing: committed memory and graph relationships are projected into a local SQLite FTS index.
-5. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
-6. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
-7. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
-8. Audit: every retrieval and redaction is logged.
+4. Observation Compiler: committed memory is projected into durable observations linked to memory and evidence.
+5. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.
+6. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
+7. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
+8. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
+9. Audit: every retrieval and redaction is logged.
 
 ## Modules
 
@@ -55,6 +56,7 @@ Rank fusion foundation
   |-- SQLite FTS/BM25 signal
   |-- stopword filtering
   |-- top relevance band filtering
+  |-- duplicate memory/observation collapse
   |-- confidence
   |-- freshness
   |-- evidence count
