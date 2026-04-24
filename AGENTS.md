@@ -62,6 +62,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - deduplicates identical memory/observation candidates while preferring memory items for redaction-sensitive payloads
   - handles stale/superseded decision abstention with current supporting evidence
   - handles conflict-style prompts with a caveated current-memory answer
+  - observation-backed trace output now includes compact lifecycle events from `observation_events` without exposing raw previous/current payloads
 - Exposed retrieval v2 through:
   - `POST /v2/retrieve`
   - MCP tool `yena.retrieve.v2`

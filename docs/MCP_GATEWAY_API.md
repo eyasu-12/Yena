@@ -196,7 +196,9 @@ Response:
             "fts_score": 5,
             "confidence": 0.91,
             "freshness": "stable",
-            "evidence_count": 1
+            "evidence_count": 1,
+            "lifecycle_event_count": 0,
+            "latest_lifecycle_event": null
           },
           "scope_filter": "repo:/Users/eyasu/Projects/Yena:https://github.com/eyasu-12/Yena.git:main",
           "redactions": [],
@@ -235,6 +237,22 @@ Abstention reasons:
 - `low_confidence`
 
 Some abstentions can include supporting memories. For example, stale/superseded decision checks may return the current active memory and its evidence while still setting `should_abstain = true`.
+
+When the selected candidate is a compiled observation, `trace.lifecycle_events` includes a compact redaction-safe lifecycle summary from `observation_events`:
+
+```json
+{
+  "candidate_source": "observation",
+  "candidate_id": "observation-decision-project-architecture-local_first",
+  "lifecycle_events": [
+    {
+      "event_type": "strengthened",
+      "created_at": "2026-04-24T12:00:00+00:00",
+      "evidence_refs": ["evidence-a", "evidence-b"]
+    }
+  ]
+}
+```
 
 Every retrieval v2 call writes:
 

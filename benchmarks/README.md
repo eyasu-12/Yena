@@ -46,6 +46,8 @@ It checks:
 - expected redaction keys from any `redactions` fields
 - expected abstention reason when a case requires abstention
 
+When `--include-trace` is used, observation-backed answers may also include compact lifecycle events from `observation_events` so retrieval debugging can distinguish loaded, strengthened, weakened, and contradicted observations without exposing raw previous/current payloads.
+
 Both scripts use only the Python standard library.
 
 ### Usage

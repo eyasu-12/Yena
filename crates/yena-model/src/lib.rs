@@ -83,6 +83,13 @@ pub enum AbstentionReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalTraceLifecycleEvent {
+    pub event_type: String,
+    pub created_at: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalTrace {
     pub candidate_source: String,
     pub candidate_id: String,
@@ -91,6 +98,8 @@ pub struct RetrievalTrace {
     pub scope_filter: String,
     pub redactions: Vec<String>,
     pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_events: Vec<RetrievalTraceLifecycleEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

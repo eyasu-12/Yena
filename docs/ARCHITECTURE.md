@@ -71,6 +71,7 @@ Memory Answer Contract
   |
   v
 Trace redaction gate
+  |-- observation lifecycle event summaries
   |
   v
 Audit event + retrieval trace
@@ -89,6 +90,8 @@ Compiled observations are the first durable smart-memory layer above raw memory 
 - the memory item and evidence IDs that caused the update
 
 This keeps observation canonicalization auditable before Yena adds richer graph reasoning or ontology-aware compaction.
+
+Retrieval v2 can include compact observation lifecycle summaries in answer traces. These summaries expose event type, time, and evidence IDs only; they do not expose raw previous/current observation payloads through the gateway trace.
 
 ## Non-Functional Requirements
 

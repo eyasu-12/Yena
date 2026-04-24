@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use yena_model::{
     AbstentionReason, MemoryAnswer, MemoryAnswerContract, MemoryFreshness, RetrievalScope,
-    RetrievalScopeKind, RetrievalTrace,
+    RetrievalScopeKind, RetrievalTrace, RetrievalTraceLifecycleEvent,
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ struct Candidate {
     freshness: MemoryFreshness,
     confidence: f32,
     evidence_refs: Vec<String>,
+    lifecycle_events: Vec<RetrievalTraceLifecycleEvent>,
     contradiction_count: i64,
     updated_at: String,
 }
@@ -39,6 +40,22 @@ struct RankedCandidate {
     score: f64,
     fts_score: Option<f64>,
 }
+
+type ObservationCandidateRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    f32,
+    i64,
+    String,
+    Option<String>,
+);
 
 pub(crate) fn retrieve(
     conn: &Connection,
@@ -164,6 +181,7 @@ pub(crate) fn safe_trace_summary(answer: &MemoryAnswerContract) -> Value {
                     "scope_filter": trace.scope_filter,
                     "redactions": trace.redactions,
                     "evidence_refs": trace.evidence_refs,
+                    "lifecycle_events": trace.lifecycle_events,
                 }))
             })
         }).collect::<Vec<_>>()
@@ -287,6 +305,7 @@ fn load_memory_candidates(
             freshness: parse_freshness(&row.get::<_, String>(9)?),
             confidence: row.get::<_, f32>(10)?,
             evidence_refs: split_group_concat(row.get(12)?),
+            lifecycle_events: Vec::new(),
             contradiction_count: 0,
             updated_at: row.get(11)?,
         })
@@ -330,25 +349,78 @@ fn load_observation_candidates(conn: &Connection) -> anyhow::Result<Vec<Candidat
         ",
     )?;
 
-    let rows = stmt.query_map([], |row| {
-        Ok(Candidate {
+    let rows = stmt.query_map([], |row| -> rusqlite::Result<ObservationCandidateRow> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, f32>(9)?,
+            row.get::<_, i64>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            id,
+            observation_type,
+            statement,
+            scope_kind,
+            repo_path,
+            repo_remote,
+            branch,
+            workspace_path,
+            freshness,
+            confidence,
+            contradiction_count,
+            updated_at,
+            evidence_raw,
+        ) = row?;
+        candidates.push(Candidate {
             source: "observation".to_string(),
-            id: row.get(0)?,
-            statement: row.get(2)?,
-            memory_type: row.get(1)?,
+            lifecycle_events: load_observation_lifecycle_events(conn, &id)?,
+            id,
+            statement,
+            memory_type: observation_type,
             value_json: json!({}),
-            scope: scope_from_row(
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-            ),
-            freshness: parse_freshness(&row.get::<_, String>(8)?),
-            confidence: row.get::<_, f32>(9)?,
-            evidence_refs: split_group_concat(row.get(12)?),
-            contradiction_count: row.get(10)?,
-            updated_at: row.get(11)?,
+            scope: scope_from_row(scope_kind, repo_path, repo_remote, branch, workspace_path),
+            freshness: parse_freshness(&freshness),
+            confidence,
+            evidence_refs: split_group_concat(evidence_raw),
+            contradiction_count,
+            updated_at,
+        });
+    }
+    Ok(candidates)
+}
+
+fn load_observation_lifecycle_events(
+    conn: &Connection,
+    observation_id: &str,
+) -> anyhow::Result<Vec<RetrievalTraceLifecycleEvent>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT event_type, evidence_record_ids_json, created_at
+        FROM observation_events
+        WHERE observation_id = ?1
+        ORDER BY created_at DESC
+        LIMIT 5
+        ",
+    )?;
+    let rows = stmt.query_map([observation_id], |row| {
+        let evidence_raw: String = row.get(1)?;
+        Ok(RetrievalTraceLifecycleEvent {
+            event_type: row.get(0)?,
+            created_at: row.get(2)?,
+            evidence_refs: serde_json::from_str(&evidence_raw).unwrap_or_default(),
         })
     })?;
 
@@ -405,6 +477,7 @@ fn load_graph_candidates(
             freshness: MemoryFreshness::Stable,
             confidence: row.get::<_, f32>(4)?,
             evidence_refs: split_group_concat(row.get(7)?),
+            lifecycle_events: Vec::new(),
             contradiction_count: 0,
             updated_at: row.get(6)?,
         })
@@ -522,10 +595,13 @@ fn build_answer(
             "confidence": ranked.candidate.confidence,
             "freshness": ranked.candidate.freshness,
             "evidence_count": ranked.candidate.evidence_refs.len(),
+            "lifecycle_event_count": ranked.candidate.lifecycle_events.len(),
+            "latest_lifecycle_event": ranked.candidate.lifecycle_events.first().map(|event| event.event_type.as_str()),
         }),
         scope_filter: scope_filter_label(&ranked.candidate.scope),
         redactions: redactions.clone(),
         evidence_refs: ranked.candidate.evidence_refs.clone(),
+        lifecycle_events: ranked.candidate.lifecycle_events.clone(),
     });
 
     MemoryAnswer {
@@ -1031,6 +1107,42 @@ mod tests {
             .contains("Do not treat Cedar as finalized"));
     }
 
+    #[test]
+    fn observation_trace_includes_lifecycle_events() {
+        let conn = test_conn();
+        seed_observation_with_events(&conn);
+
+        let answer = retrieve(
+            &conn,
+            input(
+                "Which database backs local-first storage?",
+                global_scope(),
+                true,
+            ),
+        )
+        .expect("retrieval should run");
+
+        assert!(!answer.should_abstain);
+        let trace = answer.memories[0]
+            .trace
+            .as_ref()
+            .expect("trace should be included");
+        assert_eq!(trace.candidate_source, "observation");
+        assert_eq!(trace.lifecycle_events.len(), 2);
+        assert_eq!(trace.lifecycle_events[0].event_type, "strengthened");
+        assert_eq!(
+            trace.lifecycle_events[0].evidence_refs,
+            vec!["evidence-observation-a", "evidence-observation-b"]
+        );
+        assert_eq!(
+            trace
+                .score_components
+                .get("latest_lifecycle_event")
+                .and_then(|value| value.as_str()),
+            Some("strengthened")
+        );
+    }
+
     fn input(query: &str, scope: RetrievalScope, include_trace: bool) -> RetrievalV2Input {
         RetrievalV2Input {
             query: query.to_string(),
@@ -1079,6 +1191,16 @@ mod tests {
             "../../../db/migrations/0006_retrieval_v2_foundation.sql"
         ))
         .expect("retrieval v2 migration should apply");
+        conn.execute("ALTER TABLE observations ADD COLUMN canonical_key TEXT", [])
+            .expect("observation canonical key column should be added");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0007_observation_canonical_keys.sql"
+        ))
+        .expect("observation canonical key migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0008_observation_events.sql"
+        ))
+        .expect("observation event migration should apply");
         conn
     }
 
@@ -1134,5 +1256,104 @@ mod tests {
             params![memory_id, scope_kind, repo_path, repo_remote, branch, freshness, confidence, now],
         )
         .expect("memory metadata should insert");
+    }
+
+    fn seed_observation_with_events(conn: &Connection) {
+        let created_at = "2026-04-24T00:00:00+00:00";
+        let updated_at = "2026-04-24T00:05:00+00:00";
+        conn.execute(
+            "
+            INSERT INTO observations (
+              id, canonical_key, observation_type, statement, scope_kind,
+              proof_count, confidence, freshness, contradiction_count,
+              last_verified_at, valid_from, valid_to, status, created_at, updated_at
+            ) VALUES (
+              'observation-decision-storage', 'decision:storage', 'decision',
+              'Yena uses SQLite for local-first storage', 'global',
+              2, 0.95, 'strengthening', 0, ?2, ?1, NULL, 'active', ?1, ?2
+            )
+            ",
+            params![created_at, updated_at],
+        )
+        .expect("observation should insert");
+
+        for evidence_id in ["evidence-observation-a", "evidence-observation-b"] {
+            conn.execute(
+                "INSERT INTO evidence_records (id, source_type, source_ref, content_type, content, created_at, ingested_at, checksum) VALUES (?1, 'test', ?2, 'text/plain', 'observation evidence', ?3, ?3, ?4)",
+                params![
+                    evidence_id,
+                    format!("test://{evidence_id}"),
+                    created_at,
+                    format!("sha256:{evidence_id}"),
+                ],
+            )
+            .expect("evidence should insert");
+            conn.execute(
+                "INSERT INTO observation_evidence_links (id, observation_id, evidence_record_id, link_type, created_at) VALUES (?1, 'observation-decision-storage', ?2, 'supporting_evidence', ?3)",
+                params![
+                    format!("observation-evidence-link-{evidence_id}"),
+                    evidence_id,
+                    created_at,
+                ],
+            )
+            .expect("observation evidence link should insert");
+        }
+
+        conn.execute(
+            "
+            INSERT INTO observation_events (
+              id, observation_id, canonical_key, event_type, memory_item_id,
+              previous_json, current_json, evidence_record_ids_json, created_at
+            ) VALUES (
+              'observation-event-created', 'observation-decision-storage', 'decision:storage',
+              'created', NULL, NULL, ?1, ?2, ?3
+            )
+            ",
+            params![
+                json!({
+                    "statement": "Yena uses SQLite for local-first storage",
+                    "proof_count": 1,
+                    "confidence": 0.9,
+                    "freshness": "stable",
+                    "contradiction_count": 0
+                })
+                .to_string(),
+                json!(["evidence-observation-a"]).to_string(),
+                created_at,
+            ],
+        )
+        .expect("created event should insert");
+        conn.execute(
+            "
+            INSERT INTO observation_events (
+              id, observation_id, canonical_key, event_type, memory_item_id,
+              previous_json, current_json, evidence_record_ids_json, created_at
+            ) VALUES (
+              'observation-event-strengthened', 'observation-decision-storage', 'decision:storage',
+              'strengthened', NULL, ?1, ?2, ?3, ?4
+            )
+            ",
+            params![
+                json!({
+                    "statement": "Yena uses SQLite for local-first storage",
+                    "proof_count": 1,
+                    "confidence": 0.9,
+                    "freshness": "stable",
+                    "contradiction_count": 0
+                })
+                .to_string(),
+                json!({
+                    "statement": "Yena uses SQLite for local-first storage",
+                    "proof_count": 2,
+                    "confidence": 0.95,
+                    "freshness": "strengthening",
+                    "contradiction_count": 0
+                })
+                .to_string(),
+                json!(["evidence-observation-a", "evidence-observation-b"]).to_string(),
+                updated_at,
+            ],
+        )
+        .expect("strengthened event should insert");
     }
 }
