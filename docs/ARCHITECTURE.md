@@ -9,7 +9,7 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
 3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
-4. Observation Compiler: committed memory is projected into durable observations linked to memory and evidence.
+4. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence.
 5. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.
 6. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
 7. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.

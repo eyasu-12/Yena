@@ -259,6 +259,10 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0006_retrieval_v2_foundation.sql"
     ))?;
+    apply_observation_canonical_key_migration(&conn)?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0007_observation_canonical_keys.sql"
+    ))?;
     Ok(())
 }
 
@@ -282,6 +286,25 @@ fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
             ",
             [],
         )?;
+    }
+
+    Ok(())
+}
+
+fn apply_observation_canonical_key_migration(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(observations)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut has_canonical_key = false;
+    for column in columns {
+        if column? == "canonical_key" {
+            has_canonical_key = true;
+            break;
+        }
+    }
+
+    if !has_canonical_key {
+        conn.execute("ALTER TABLE observations ADD COLUMN canonical_key TEXT", [])?;
     }
 
     Ok(())

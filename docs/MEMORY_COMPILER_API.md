@@ -60,7 +60,7 @@ Behavior:
 - Links provided evidence records.
 - Upserts retrieval metadata with proposal confidence, scope, and freshness.
 - Re-indexes the active memory into `retrieval_documents_fts` for retrieval v2.
-- Compiles or updates a linked `observations` row with evidence links and an observation FTS document.
+- Compiles or updates a canonical `observations` row with memory links, merged evidence links, and an observation FTS document.
 - Marks proposal as `committed`.
 
 Response `200`:

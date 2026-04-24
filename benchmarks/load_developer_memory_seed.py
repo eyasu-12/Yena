@@ -91,10 +91,13 @@ def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path) -> None:
         "0004_graph_confidence.sql",
         "0005_graph_canonicalization.sql",
         "0006_retrieval_v2_foundation.sql",
+        "0007_observation_canonical_keys.sql",
     ]
     for migration in ordered:
         if migration == "0004_graph_confidence.sql":
             ensure_graph_confidence_column(conn)
+        if migration == "0007_observation_canonical_keys.sql":
+            ensure_observation_canonical_key_column(conn)
         path = migrations_dir / migration
         try:
             conn.executescript(path.read_text())
@@ -109,6 +112,12 @@ def ensure_graph_confidence_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE graph_relationship_versions "
             "ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"
         )
+
+
+def ensure_observation_canonical_key_column(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
+    if "canonical_key" not in columns:
+        conn.execute("ALTER TABLE observations ADD COLUMN canonical_key TEXT")
 
 
 def load_seed(
@@ -293,7 +302,22 @@ def load_memories(
 
         upsert_memory_metadata(conn, memory_item_id, active_memory, scope, updated_at)
         upsert_fts_document(conn, memory_item_id, canonical_key, active_memory, evidence_by_id, scope)
-        upsert_observation(conn, memory_item_id, canonical_key, active_memory, evidence_by_id, scope)
+        observation_memory = dict(active_memory)
+        observation_memory["evidence_ids"] = sorted(
+            {
+                evidence_id
+                for version in ordered_versions
+                for evidence_id in version.get("evidence_ids", [])
+            }
+        )
+        upsert_observation(
+            conn,
+            memory_item_id,
+            canonical_key,
+            observation_memory,
+            evidence_by_id,
+            scope,
+        )
         observation_count += 1
         fts_count += 2
 
@@ -382,19 +406,21 @@ def upsert_observation(
     evidence_by_id: dict[str, dict[str, Any]],
     scope: dict[str, str | None],
 ) -> None:
-    observation_id = f"observation-{memory_item_id}"
+    observation_key = f"{normalize_token(require(memory, 'memory_type'))}:{canonical_key.strip()}"
+    observation_id = f"observation-{stable_key_fragment(canonical_key)}"
     statement = statement_for(memory)
     evidence_ids = memory.get("evidence_ids", [])
     conn.execute(
         """
         INSERT OR REPLACE INTO observations (
-          id, observation_type, statement, scope_kind, repo_path, repo_remote, branch,
+          id, canonical_key, observation_type, statement, scope_kind, repo_path, repo_remote, branch,
           workspace_path, proof_count, confidence, freshness, contradiction_count,
           last_verified_at, valid_from, valid_to, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, 'active', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, 'active', ?, ?)
         """,
         (
             observation_id,
+            observation_key,
             require(memory, "memory_type"),
             statement,
             scope["scope_kind"],
@@ -524,6 +550,18 @@ def supersedes_version_id(versions: list[dict[str, Any]], index: int) -> str | N
     if index <= 1:
         return None
     return version_id(versions[index - 2])
+
+
+def normalize_token(value: str) -> str:
+    return value.strip().lower()
+
+
+def stable_key_fragment(value: str) -> str:
+    fragment = "".join(
+        char.lower() if char.isascii() and (char.isalnum() or char in "-_") else "-"
+        for char in value.strip()
+    ).strip("-")
+    return fragment or "empty"
 
 
 def require(mapping: dict[str, Any], key: str) -> Any:

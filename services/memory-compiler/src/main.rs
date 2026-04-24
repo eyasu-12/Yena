@@ -809,13 +809,14 @@ async fn commit_proposal(
         &payload.value_json,
         payload.scope.as_ref(),
     )?;
+    let observation_evidence_ids = load_memory_evidence_ids(&tx, &memory_item_id)?;
     upsert_observation_for_memory(
         &tx,
         &memory_item_id,
         &proposal.subject_key,
         &payload.memory_type,
         &payload.value_json,
-        &payload.evidence_record_ids,
+        &observation_evidence_ids,
         payload.scope.as_ref(),
         payload.freshness.as_deref(),
         proposal.confidence,
@@ -932,6 +933,32 @@ fn upsert_memory_fts_document(
     )
 }
 
+fn load_memory_evidence_ids(
+    conn: &Connection,
+    memory_item_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT DISTINCT ml.evidence_record_id
+            FROM memory_item_versions mv
+            JOIN memory_links ml ON ml.memory_item_version_id = mv.id
+            WHERE mv.memory_item_id = ?1
+            ORDER BY ml.evidence_record_id
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to prepare memory evidence query: {}", e))
+        })?;
+
+    let rows = stmt
+        .query_map(params![memory_item_id], |row| row.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to query memory evidence: {}", e)))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read memory evidence: {}", e)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_observation_for_memory(
     tx: &Transaction<'_>,
@@ -945,7 +972,16 @@ fn upsert_observation_for_memory(
     confidence: f32,
     updated_at: &str,
 ) -> Result<(), ApiError> {
-    let observation_id = observation_id_for_memory(memory_item_id);
+    let observation_key = observation_key(memory_type, canonical_key);
+    let observation_id = tx
+        .query_row(
+            "SELECT id FROM observations WHERE canonical_key = ?1 LIMIT 1",
+            params![&observation_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup observation: {}", e)))?
+        .unwrap_or_else(|| observation_id_for_canonical_key(canonical_key));
     let statement = statement_from_memory_value(canonical_key, value_json);
     let scope_kind = scope
         .and_then(|s| s.kind.as_deref())
@@ -960,46 +996,72 @@ fn upsert_observation_for_memory(
     let workspace_path = scope.and_then(|s| trim_scope_field(s.workspace_path.as_deref()));
     let proof_count = evidence_record_ids.len() as i64;
 
-    tx.execute(
-        "
-        INSERT INTO observations (
-          id, observation_type, statement, scope_kind, repo_path, repo_remote, branch,
-          workspace_path, proof_count, confidence, freshness, contradiction_count,
-          last_verified_at, valid_from, valid_to, status, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?12, NULL, 'active', ?12, ?12)
-        ON CONFLICT(id) DO UPDATE SET
-          observation_type = excluded.observation_type,
-          statement = excluded.statement,
-          scope_kind = excluded.scope_kind,
-          repo_path = excluded.repo_path,
-          repo_remote = excluded.repo_remote,
-          branch = excluded.branch,
-          workspace_path = excluded.workspace_path,
-          proof_count = excluded.proof_count,
-          confidence = excluded.confidence,
-          freshness = excluded.freshness,
-          contradiction_count = excluded.contradiction_count,
-          last_verified_at = excluded.last_verified_at,
-          valid_to = NULL,
-          status = 'active',
-          updated_at = excluded.updated_at
-        ",
-        params![
-            &observation_id,
-            memory_type,
-            &statement,
-            scope_kind,
-            repo_path,
-            repo_remote,
-            branch,
-            workspace_path,
-            proof_count,
-            confidence,
-            freshness,
-            updated_at,
-        ],
-    )
-    .map_err(|e| ApiError::internal(format!("failed to upsert observation: {}", e)))?;
+    let changed = tx
+        .execute(
+            "
+            UPDATE observations
+            SET observation_type = ?2,
+                statement = ?3,
+                scope_kind = ?4,
+                repo_path = ?5,
+                repo_remote = ?6,
+                branch = ?7,
+                workspace_path = ?8,
+                proof_count = ?9,
+                confidence = ?10,
+                freshness = ?11,
+                contradiction_count = 0,
+                last_verified_at = ?12,
+                valid_to = NULL,
+                status = 'active',
+                updated_at = ?12
+            WHERE canonical_key = ?1
+            ",
+            params![
+                &observation_key,
+                memory_type,
+                &statement,
+                scope_kind,
+                repo_path,
+                repo_remote,
+                branch,
+                workspace_path,
+                proof_count,
+                confidence,
+                freshness,
+                updated_at,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to update observation: {}", e)))?;
+
+    if changed == 0 {
+        tx.execute(
+            "
+            INSERT INTO observations (
+              id, canonical_key, observation_type, statement, scope_kind, repo_path,
+              repo_remote, branch, workspace_path, proof_count, confidence, freshness,
+              contradiction_count, last_verified_at, valid_from, valid_to, status,
+              created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?13, NULL, 'active', ?13, ?13)
+            ",
+            params![
+                &observation_id,
+                &observation_key,
+                memory_type,
+                &statement,
+                scope_kind,
+                repo_path,
+                repo_remote,
+                branch,
+                workspace_path,
+                proof_count,
+                confidence,
+                freshness,
+                updated_at,
+            ],
+        )
+        .map_err(|e| ApiError::internal(format!("failed to insert observation: {}", e)))?;
+    }
 
     tx.execute(
         "DELETE FROM observation_memory_links WHERE observation_id = ?1",
@@ -1013,7 +1075,7 @@ fn upsert_observation_for_memory(
         ) VALUES (?1, ?2, ?3, 'compiled_from_memory', ?4)
         ",
         params![
-            format!("observation-memory-link-{}", memory_item_id),
+            format!("observation-memory-link-{}", observation_id),
             &observation_id,
             memory_item_id,
             updated_at,
@@ -1038,7 +1100,7 @@ fn upsert_observation_for_memory(
             params![
                 format!(
                     "observation-evidence-link-{}-{}",
-                    memory_item_id, evidence_id
+                    observation_id, evidence_id
                 ),
                 &observation_id,
                 evidence_id,
@@ -1072,8 +1134,33 @@ fn upsert_observation_for_memory(
     Ok(())
 }
 
-fn observation_id_for_memory(memory_item_id: &str) -> String {
-    format!("observation-{}", memory_item_id)
+fn observation_id_for_canonical_key(canonical_key: &str) -> String {
+    format!("observation-{}", stable_key_fragment(canonical_key))
+}
+
+fn observation_key(memory_type: &str, canonical_key: &str) -> String {
+    format!("{}:{}", normalize_token(memory_type), canonical_key.trim())
+}
+
+fn stable_key_fragment(value: &str) -> String {
+    let fragment = value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if fragment.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        fragment
+    }
 }
 
 fn statement_from_memory_value(canonical_key: &str, value_json: &Value) -> String {
@@ -3260,6 +3347,10 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0006_retrieval_v2_foundation.sql"
     ))?;
+    apply_observation_canonical_key_migration(&conn)?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0007_observation_canonical_keys.sql"
+    ))?;
     Ok(())
 }
 
@@ -3288,15 +3379,34 @@ fn apply_graph_confidence_migration(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn apply_observation_canonical_key_migration(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(observations)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut has_canonical_key = false;
+    for column in columns {
+        if column? == "canonical_key" {
+            has_canonical_key = true;
+            break;
+        }
+    }
+
+    if !has_canonical_key {
+        conn.execute("ALTER TABLE observations ADD COLUMN canonical_key TEXT", [])?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{params, Connection};
     use serde_json::json;
 
     use super::{
-        apply_graph_confidence_migration, compact_graph_relationships, ensure_graph_entity,
-        ensure_graph_entity_without_alias, upsert_observation_for_memory, CreateProposalRequest,
-        GraphEntityRef,
+        apply_graph_confidence_migration, apply_observation_canonical_key_migration,
+        compact_graph_relationships, ensure_graph_entity, ensure_graph_entity_without_alias,
+        upsert_observation_for_memory, CreateProposalRequest, GraphEntityRef,
     };
 
     #[test]
@@ -3346,17 +3456,18 @@ mod tests {
         .expect("observation should compile");
         tx.commit().expect("transaction should commit");
 
-        let (statement, proof_count, confidence): (String, i64, f32) = conn
+        let (canonical_key, statement, proof_count, confidence): (String, String, i64, f32) = conn
             .query_row(
                 "
-                SELECT statement, proof_count, confidence
+                SELECT canonical_key, statement, proof_count, confidence
                 FROM observations
-                WHERE id = 'observation-memory-observation'
+                WHERE id = 'observation-project-storage'
                 ",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("observation should be queryable");
+        assert_eq!(canonical_key, "decision:project.storage");
         assert_eq!(statement, "Yena uses SQLite for local-first storage.");
         assert_eq!(proof_count, 1);
         assert_eq!(confidence, 0.92);
@@ -3366,7 +3477,7 @@ mod tests {
                 "
                 SELECT COUNT(*)
                 FROM observation_evidence_links
-                WHERE observation_id = 'observation-memory-observation'
+                WHERE observation_id = 'observation-project-storage'
                 ",
                 [],
                 |row| row.get(0),
@@ -3380,7 +3491,7 @@ mod tests {
                 SELECT COUNT(*)
                 FROM retrieval_documents_fts
                 WHERE source_type = 'observation'
-                  AND source_id = 'observation-memory-observation'
+                  AND source_id = 'observation-project-storage'
                   AND retrieval_documents_fts MATCH 'sqlite'
                 ",
                 [],
@@ -3388,6 +3499,48 @@ mod tests {
             )
             .expect("observation FTS document should be queryable");
         assert_eq!(fts_count, 1);
+
+        insert_evidence(&conn, "evidence-observation-2", now);
+        let tx = conn.transaction().expect("second transaction should start");
+        upsert_observation_for_memory(
+            &tx,
+            "memory-observation",
+            "project.storage",
+            "decision",
+            &json!({"decision":"Yena still uses SQLite for local-first storage."}),
+            &[
+                "evidence-observation".to_string(),
+                "evidence-observation-2".to_string(),
+            ],
+            None,
+            Some("strengthening"),
+            0.95,
+            now,
+        )
+        .expect("observation should strengthen");
+        tx.commit().expect("second transaction should commit");
+
+        let (observation_count, strengthened_proof_count, strengthened_confidence): (
+            i64,
+            i64,
+            f32,
+        ) = conn
+            .query_row(
+                "
+                SELECT
+                  (SELECT COUNT(*) FROM observations WHERE canonical_key = 'decision:project.storage'),
+                  proof_count,
+                  confidence
+                FROM observations
+                WHERE id = 'observation-project-storage'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("strengthened observation should be queryable");
+        assert_eq!(observation_count, 1);
+        assert_eq!(strengthened_proof_count, 2);
+        assert_eq!(strengthened_confidence, 0.95);
     }
 
     #[test]
@@ -3580,6 +3733,12 @@ mod tests {
             "../../../db/migrations/0006_retrieval_v2_foundation.sql"
         ))
         .expect("retrieval v2 foundation migration should apply");
+        apply_observation_canonical_key_migration(&conn)
+            .expect("observation canonical key migration should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0007_observation_canonical_keys.sql"
+        ))
+        .expect("observation canonical indexes should apply");
         conn
     }
 
