@@ -90,10 +90,6 @@ pub(crate) fn retrieve(
     {
         return Ok(abstain(input, AbstentionReason::StaleMemory));
     }
-    if scoped.iter().any(|r| r.candidate.contradiction_count > 0) {
-        return Ok(abstain(input, AbstentionReason::Contradicted));
-    }
-
     scoped.retain(|r| r.candidate.freshness != MemoryFreshness::Stale);
     scoped.sort_by(|a, b| {
         b.score
@@ -103,6 +99,13 @@ pub(crate) fn retrieve(
     });
     dedupe_ranked_candidates(&mut scoped);
     retain_top_relevance_band(&mut scoped);
+
+    if scoped.iter().any(candidate_is_contradicted) {
+        return Ok(abstain(input, AbstentionReason::Contradicted));
+    }
+    if scoped.first().map(candidate_is_weakening).unwrap_or(false) {
+        return Ok(abstain(input, AbstentionReason::LowConfidence));
+    }
 
     if scoped
         .first()
@@ -563,9 +566,11 @@ fn match_candidates(
                 MemoryFreshness::Weakening => -0.2,
                 MemoryFreshness::Stale => -1.0,
             };
+            let lifecycle_boost = lifecycle_score_boost(&candidate);
             let score = (matched_terms.len() as f64 * 10.0)
                 + candidate.confidence as f64
                 + freshness_boost
+                + lifecycle_boost
                 + (candidate.evidence_refs.len() as f64 * 0.1)
                 + fts_score.unwrap_or(0.0);
             Some(RankedCandidate {
@@ -597,6 +602,7 @@ fn build_answer(
             "evidence_count": ranked.candidate.evidence_refs.len(),
             "lifecycle_event_count": ranked.candidate.lifecycle_events.len(),
             "latest_lifecycle_event": ranked.candidate.lifecycle_events.first().map(|event| event.event_type.as_str()),
+            "lifecycle_score_boost": lifecycle_score_boost(&ranked.candidate),
         }),
         scope_filter: scope_filter_label(&ranked.candidate.scope),
         redactions: redactions.clone(),
@@ -839,6 +845,33 @@ fn candidate_represents_unresolved_decision(candidate: &Candidate) -> bool {
 
 fn answer_represents_unresolved_decision(answer: &MemoryAnswer) -> bool {
     unresolved_decision_text(&answer.statement)
+}
+
+fn candidate_is_contradicted(ranked: &RankedCandidate) -> bool {
+    ranked.candidate.contradiction_count > 0
+        || latest_lifecycle_event_type(&ranked.candidate) == Some("contradicted")
+}
+
+fn candidate_is_weakening(ranked: &RankedCandidate) -> bool {
+    ranked.candidate.freshness == MemoryFreshness::Weakening
+        || latest_lifecycle_event_type(&ranked.candidate) == Some("weakened")
+}
+
+fn lifecycle_score_boost(candidate: &Candidate) -> f64 {
+    match latest_lifecycle_event_type(candidate) {
+        Some("strengthened") => 0.4,
+        Some("created" | "loaded") => 0.05,
+        Some("weakened") => -1.0,
+        Some("contradicted") => -2.0,
+        _ => 0.0,
+    }
+}
+
+fn latest_lifecycle_event_type(candidate: &Candidate) -> Option<&str> {
+    candidate
+        .lifecycle_events
+        .first()
+        .map(|event| event.event_type.as_str())
 }
 
 fn unresolved_decision_text(statement: &str) -> bool {
@@ -1143,6 +1176,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn top_contradicted_observation_abstains() {
+        let conn = test_conn();
+        seed_observation_candidate(
+            &conn,
+            "observation-contradicted-storage",
+            "project_decision",
+            "SQLite storage choice is contradicted by later evidence",
+            "weakening",
+            0.75,
+            1,
+            "contradicted",
+        );
+
+        let answer = retrieve(&conn, input("SQLite storage choice", global_scope(), true))
+            .expect("retrieval should run");
+
+        assert!(answer.should_abstain);
+        assert_eq!(
+            answer.abstention_reason,
+            Some(AbstentionReason::Contradicted)
+        );
+    }
+
+    #[test]
+    fn top_weakened_observation_abstains_as_low_confidence() {
+        let conn = test_conn();
+        seed_observation_candidate(
+            &conn,
+            "observation-weakened-storage",
+            "project_decision",
+            "SQLite storage choice has weaker support than before",
+            "weakening",
+            0.72,
+            0,
+            "weakened",
+        );
+
+        let answer = retrieve(&conn, input("SQLite storage choice", global_scope(), true))
+            .expect("retrieval should run");
+
+        assert!(answer.should_abstain);
+        assert_eq!(
+            answer.abstention_reason,
+            Some(AbstentionReason::LowConfidence)
+        );
+    }
+
+    #[test]
+    fn low_rank_contradiction_does_not_poison_stronger_answer() {
+        let conn = test_conn();
+        seed_memory(
+            &conn,
+            "mem-storage-current",
+            "ver-storage-current",
+            "project_decision",
+            "decision:storage.current",
+            json!({"statement":"SQLite durable embedded local-first storage chosen for Yena"}),
+            "global",
+            None,
+            None,
+            None,
+            "stable",
+            0.96,
+        );
+        seed_observation_candidate(
+            &conn,
+            "observation-contradicted-low-rank",
+            "project_decision",
+            "SQLite storage choice is contradicted",
+            "weakening",
+            0.65,
+            1,
+            "contradicted",
+        );
+
+        let answer = retrieve(
+            &conn,
+            input(
+                "SQLite durable embedded local-first storage chosen",
+                global_scope(),
+                true,
+            ),
+        )
+        .expect("retrieval should run");
+
+        assert!(!answer.should_abstain);
+        assert_eq!(
+            answer.memories[0].statement,
+            "SQLite durable embedded local-first storage chosen for Yena"
+        );
+        assert_eq!(answer.memories[0].memory_type, "project_decision");
+    }
+
     fn input(query: &str, scope: RetrievalScope, include_trace: bool) -> RetrievalV2Input {
         RetrievalV2Input {
             query: query.to_string(),
@@ -1355,5 +1482,90 @@ mod tests {
             ],
         )
         .expect("strengthened event should insert");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_observation_candidate(
+        conn: &Connection,
+        observation_id: &str,
+        observation_type: &str,
+        statement: &str,
+        freshness: &str,
+        confidence: f32,
+        contradiction_count: i64,
+        latest_event_type: &str,
+    ) {
+        let created_at = "2026-04-24T00:00:00+00:00";
+        let evidence_id = format!("evidence-{observation_id}");
+        conn.execute(
+            "
+            INSERT INTO observations (
+              id, canonical_key, observation_type, statement, scope_kind,
+              proof_count, confidence, freshness, contradiction_count,
+              last_verified_at, valid_from, valid_to, status, created_at, updated_at
+            ) VALUES (
+              ?1, ?2, ?3, ?4, 'global',
+              1, ?5, ?6, ?7, ?8, ?8, NULL, 'active', ?8, ?8
+            )
+            ",
+            params![
+                observation_id,
+                format!("{observation_type}:{observation_id}"),
+                observation_type,
+                statement,
+                confidence,
+                freshness,
+                contradiction_count,
+                created_at,
+            ],
+        )
+        .expect("observation should insert");
+        conn.execute(
+            "INSERT INTO evidence_records (id, source_type, source_ref, content_type, content, created_at, ingested_at, checksum) VALUES (?1, 'test', ?2, 'text/plain', 'observation evidence', ?3, ?3, ?4)",
+            params![
+                evidence_id,
+                format!("test://{observation_id}"),
+                created_at,
+                format!("sha256:{observation_id}"),
+            ],
+        )
+        .expect("evidence should insert");
+        conn.execute(
+            "INSERT INTO observation_evidence_links (id, observation_id, evidence_record_id, link_type, created_at) VALUES (?1, ?2, ?3, 'supporting_evidence', ?4)",
+            params![
+                format!("observation-evidence-link-{observation_id}"),
+                observation_id,
+                evidence_id,
+                created_at,
+            ],
+        )
+        .expect("observation evidence link should insert");
+        conn.execute(
+            "
+            INSERT INTO observation_events (
+              id, observation_id, canonical_key, event_type, memory_item_id,
+              previous_json, current_json, evidence_record_ids_json, created_at
+            ) VALUES (
+              ?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?7
+            )
+            ",
+            params![
+                format!("observation-event-{observation_id}"),
+                observation_id,
+                format!("{observation_type}:{observation_id}"),
+                latest_event_type,
+                json!({
+                    "statement": statement,
+                    "proof_count": 1,
+                    "confidence": confidence,
+                    "freshness": freshness,
+                    "contradiction_count": contradiction_count
+                })
+                .to_string(),
+                json!([evidence_id]).to_string(),
+                created_at,
+            ],
+        )
+        .expect("observation event should insert");
     }
 }

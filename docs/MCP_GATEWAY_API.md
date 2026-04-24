@@ -198,7 +198,8 @@ Response:
             "freshness": "stable",
             "evidence_count": 1,
             "lifecycle_event_count": 0,
-            "latest_lifecycle_event": null
+            "latest_lifecycle_event": null,
+            "lifecycle_score_boost": 0.0
           },
           "scope_filter": "repo:/Users/eyasu/Projects/Yena:https://github.com/eyasu-12/Yena.git:main",
           "redactions": [],
@@ -253,6 +254,13 @@ When the selected candidate is a compiled observation, `trace.lifecycle_events` 
   ]
 }
 ```
+
+Retrieval v2 uses lifecycle events as a trust signal:
+
+- `strengthened` observations receive a small ranking boost.
+- `weakened` observations are penalized and abstain as `low_confidence` if they are still the best relevant candidate.
+- `contradicted` observations are penalized and abstain as `contradicted` if they remain in the top relevance band.
+- Lower-ranked contradicted observations outside the top relevance band do not poison a stronger supported answer.
 
 Every retrieval v2 call writes:
 

@@ -48,6 +48,8 @@ It checks:
 
 When `--include-trace` is used, observation-backed answers may also include compact lifecycle events from `observation_events` so retrieval debugging can distinguish loaded, strengthened, weakened, and contradicted observations without exposing raw previous/current payloads.
 
+Retrieval v2 also uses those lifecycle events as trust signals: strengthened observations get a modest ranking boost, weakened top candidates abstain as low-confidence, and contradicted candidates abstain only if they remain in the top relevance band after ranking.
+
 Both scripts use only the Python standard library.
 
 ### Usage

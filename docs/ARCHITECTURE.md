@@ -93,6 +93,8 @@ This keeps observation canonicalization auditable before Yena adds richer graph 
 
 Retrieval v2 can include compact observation lifecycle summaries in answer traces. These summaries expose event type, time, and evidence IDs only; they do not expose raw previous/current observation payloads through the gateway trace.
 
+Retrieval ranking also uses observation lifecycle as a trust signal. Strengthened observations receive a small boost, weakened observations are treated as low-confidence when they are the best relevant match, and contradicted observations only force abstention if they remain inside the top relevance band after ranking.
+
 ## Non-Functional Requirements
 
 - Local-first by default.
