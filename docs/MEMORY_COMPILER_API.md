@@ -62,6 +62,7 @@ Behavior:
 - Re-indexes the active memory into `retrieval_documents_fts` for retrieval v2.
 - Compiles or updates a canonical `observations` row with memory links, merged evidence links, and an observation FTS document.
 - Classifies observation updates as strengthening, weakening, or contradicted based on prior statement similarity, proof count, confidence, and freshness.
+- Appends an `observation_events` audit row that captures the previous and current compiled observation state.
 - Marks proposal as `committed`.
 
 Response `200`:
@@ -129,6 +130,75 @@ Response `200`:
       "valid_to": null,
       "created_at": "2026-02-16T01:00:01+00:00",
       "evidence_record_ids": ["uuid"]
+    }
+  ]
+}
+```
+
+## GET /v1/observations/{canonical_key}
+
+Returns the active compiled observation plus linked memory and evidence IDs.
+
+Observation canonical keys include the memory type prefix, for example `decision:project.storage`.
+
+Response `200`:
+
+```json
+{
+  "observation_id": "uuid",
+  "canonical_key": "decision:project.storage",
+  "observation_type": "decision",
+  "statement": "Yena uses SQLite for local-first storage.",
+  "scope_kind": "repo",
+  "repo_path": "/Users/eyasu/Projects/Yena",
+  "repo_remote": "https://github.com/eyasu-12/Yena.git",
+  "branch": "main",
+  "workspace_path": null,
+  "proof_count": 2,
+  "confidence": 0.95,
+  "freshness": "strengthening",
+  "contradiction_count": 0,
+  "last_verified_at": "2026-04-24T12:00:00+00:00",
+  "valid_from": "2026-04-24T12:00:00+00:00",
+  "valid_to": null,
+  "status": "active",
+  "updated_at": "2026-04-24T12:00:00+00:00",
+  "memory_item_ids": ["uuid"],
+  "evidence_record_ids": ["uuid"]
+}
+```
+
+## GET /v1/observations/{canonical_key}/history
+
+Returns the observation event log for a compiled observation.
+
+Response `200`:
+
+```json
+{
+  "observation_id": "uuid",
+  "canonical_key": "decision:project.storage",
+  "events": [
+    {
+      "event_id": "uuid",
+      "event_type": "strengthened",
+      "memory_item_id": "uuid",
+      "previous_json": {
+        "statement": "Yena uses SQLite for local-first storage.",
+        "proof_count": 1,
+        "confidence": 0.92,
+        "freshness": "stable",
+        "contradiction_count": 0
+      },
+      "current_json": {
+        "statement": "Yena still uses SQLite for local-first storage.",
+        "proof_count": 2,
+        "confidence": 0.95,
+        "freshness": "strengthening",
+        "contradiction_count": 0
+      },
+      "evidence_record_ids": ["uuid"],
+      "created_at": "2026-04-24T12:00:00+00:00"
     }
   ]
 }

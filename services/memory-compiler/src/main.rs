@@ -156,6 +156,69 @@ struct MemoryVersionHistoryEntry {
     evidence_record_ids: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ObservationViewResponse {
+    observation_id: String,
+    canonical_key: String,
+    observation_type: String,
+    statement: String,
+    scope_kind: String,
+    repo_path: Option<String>,
+    repo_remote: Option<String>,
+    branch: Option<String>,
+    workspace_path: Option<String>,
+    proof_count: i64,
+    confidence: f32,
+    freshness: String,
+    contradiction_count: i64,
+    last_verified_at: Option<String>,
+    valid_from: String,
+    valid_to: Option<String>,
+    status: String,
+    updated_at: String,
+    memory_item_ids: Vec<String>,
+    evidence_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ObservationHistoryResponse {
+    observation_id: String,
+    canonical_key: String,
+    events: Vec<ObservationEventEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ObservationEventEntry {
+    event_id: String,
+    event_type: String,
+    memory_item_id: Option<String>,
+    previous_json: Option<Value>,
+    current_json: Value,
+    evidence_record_ids: Vec<String>,
+    created_at: String,
+}
+
+type ObservationViewRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    f32,
+    String,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
 #[derive(Debug, Deserialize)]
 struct UpsertRetentionPolicyRequest {
     policy_name: String,
@@ -606,6 +669,11 @@ async fn main() -> anyhow::Result<()> {
             "/v1/memory/{canonical_key}/history",
             get(get_memory_history),
         )
+        .route("/v1/observations/{canonical_key}", get(get_observation))
+        .route(
+            "/v1/observations/{canonical_key}/history",
+            get(get_observation_history),
+        )
         .route("/v1/memory/forget", post(forget_memory))
         .route(
             "/v1/graph/proposals/relationships",
@@ -959,6 +1027,59 @@ fn load_memory_evidence_ids(
         .map_err(|e| ApiError::internal(format!("failed to read memory evidence: {}", e)))
 }
 
+fn load_observation_memory_ids(
+    conn: &Connection,
+    observation_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT memory_item_id
+            FROM observation_memory_links
+            WHERE observation_id = ?1
+            ORDER BY memory_item_id
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to prepare observation memory query: {}", e))
+        })?;
+
+    let rows = stmt
+        .query_map(params![observation_id], |row| row.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to query observation memory: {}", e)))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read observation memory: {}", e)))
+}
+
+fn load_observation_evidence_ids(
+    conn: &Connection,
+    observation_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT evidence_record_id
+            FROM observation_evidence_links
+            WHERE observation_id = ?1
+            ORDER BY evidence_record_id
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to prepare observation evidence query: {}",
+                e
+            ))
+        })?;
+
+    let rows = stmt
+        .query_map(params![observation_id], |row| row.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to query observation evidence: {}", e)))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read observation evidence: {}", e)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_observation_for_memory(
     tx: &Transaction<'_>,
@@ -981,7 +1102,7 @@ fn upsert_observation_for_memory(
         )
         .optional()
         .map_err(|e| ApiError::internal(format!("failed to lookup observation: {}", e)))?
-        .unwrap_or_else(|| observation_id_for_canonical_key(canonical_key));
+        .unwrap_or_else(|| observation_id_for_canonical_key(&observation_key));
     let statement = statement_from_memory_value(canonical_key, value_json);
     let scope_kind = scope
         .and_then(|s| s.kind.as_deref())
@@ -1003,6 +1124,7 @@ fn upsert_observation_for_memory(
         confidence,
         Some(freshness.as_str()),
     );
+    let previous_json = prior.as_ref().map(existing_observation_json);
 
     let changed = tx
         .execute(
@@ -1140,6 +1262,23 @@ fn upsert_observation_for_memory(
         canonical_key,
         &format!("{} {}", statement, body),
     )?;
+    insert_observation_event(
+        tx,
+        &observation_id,
+        &observation_key,
+        &semantics.event_type,
+        memory_item_id,
+        previous_json,
+        observation_event_json(
+            &statement,
+            proof_count,
+            semantics.confidence,
+            &semantics.freshness,
+            semantics.contradiction_count,
+        ),
+        evidence_record_ids,
+        updated_at,
+    )?;
 
     Ok(())
 }
@@ -1149,11 +1288,13 @@ struct ExistingObservation {
     statement: String,
     proof_count: i64,
     confidence: f32,
+    freshness: String,
     contradiction_count: i64,
 }
 
 #[derive(Debug, Clone)]
 struct ObservationSemantics {
+    event_type: String,
     freshness: String,
     confidence: f32,
     contradiction_count: i64,
@@ -1165,7 +1306,7 @@ fn load_existing_observation(
 ) -> Result<Option<ExistingObservation>, ApiError> {
     tx.query_row(
         "
-        SELECT statement, proof_count, confidence, contradiction_count
+        SELECT statement, proof_count, confidence, freshness, contradiction_count
         FROM observations
         WHERE canonical_key = ?1
         LIMIT 1
@@ -1176,7 +1317,8 @@ fn load_existing_observation(
                 statement: row.get(0)?,
                 proof_count: row.get(1)?,
                 confidence: row.get(2)?,
-                contradiction_count: row.get(3)?,
+                freshness: row.get(3)?,
+                contradiction_count: row.get(4)?,
             })
         },
     )
@@ -1196,6 +1338,7 @@ fn classify_observation_update(
         .unwrap_or_else(|| "stable".to_string());
     let Some(prior) = prior else {
         return ObservationSemantics {
+            event_type: "created".to_string(),
             freshness: requested,
             confidence: next_confidence,
             contradiction_count: 0,
@@ -1205,6 +1348,7 @@ fn classify_observation_update(
     let similarity = statement_similarity(&prior.statement, next_statement);
     if similarity < 0.25 {
         return ObservationSemantics {
+            event_type: "contradicted".to_string(),
             freshness: "weakening".to_string(),
             confidence: next_confidence.min(prior.confidence),
             contradiction_count: prior.contradiction_count + 1,
@@ -1212,6 +1356,7 @@ fn classify_observation_update(
     }
     if requested == "stale" || requested == "weakening" || next_confidence < prior.confidence {
         return ObservationSemantics {
+            event_type: "weakened".to_string(),
             freshness: "weakening".to_string(),
             confidence: next_confidence.min(prior.confidence),
             contradiction_count: prior.contradiction_count,
@@ -1219,6 +1364,7 @@ fn classify_observation_update(
     }
     if similarity >= 0.45 || next_proof_count > prior.proof_count {
         return ObservationSemantics {
+            event_type: "strengthened".to_string(),
             freshness: "strengthening".to_string(),
             confidence: next_confidence.max(prior.confidence),
             contradiction_count: prior.contradiction_count,
@@ -1226,10 +1372,77 @@ fn classify_observation_update(
     }
 
     ObservationSemantics {
+        event_type: "updated".to_string(),
         freshness: requested,
         confidence: next_confidence,
         contradiction_count: prior.contradiction_count,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_observation_event(
+    tx: &Transaction<'_>,
+    observation_id: &str,
+    canonical_key: &str,
+    event_type: &str,
+    memory_item_id: &str,
+    previous_json: Option<Value>,
+    current_json: Value,
+    evidence_record_ids: &[String],
+    created_at: &str,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "
+        INSERT INTO observation_events (
+          id, observation_id, canonical_key, event_type, memory_item_id,
+          previous_json, current_json, evidence_record_ids_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+        params![
+            Uuid::new_v4().to_string(),
+            observation_id,
+            canonical_key,
+            event_type,
+            memory_item_id,
+            previous_json.map(|value| value.to_string()),
+            current_json.to_string(),
+            serde_json::to_string(evidence_record_ids).map_err(|e| {
+                ApiError::internal(format!(
+                    "failed to encode observation event evidence: {}",
+                    e
+                ))
+            })?,
+            created_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert observation event: {}", e)))?;
+    Ok(())
+}
+
+fn existing_observation_json(observation: &ExistingObservation) -> Value {
+    observation_event_json(
+        &observation.statement,
+        observation.proof_count,
+        observation.confidence,
+        &observation.freshness,
+        observation.contradiction_count,
+    )
+}
+
+fn observation_event_json(
+    statement: &str,
+    proof_count: i64,
+    confidence: f32,
+    freshness: &str,
+    contradiction_count: i64,
+) -> Value {
+    json!({
+        "statement": statement,
+        "proof_count": proof_count,
+        "confidence": confidence,
+        "freshness": freshness,
+        "contradiction_count": contradiction_count,
+    })
 }
 
 fn statement_similarity(left: &str, right: &str) -> f32 {
@@ -2173,6 +2386,174 @@ async fn get_memory_history(
         canonical_key,
         memory_type,
         versions,
+    }))
+}
+
+async fn get_observation(
+    State(state): State<AppState>,
+    Path(canonical_key): Path<String>,
+) -> Result<Json<ObservationViewResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+    let row: Option<ObservationViewRow> = conn
+        .query_row(
+            "
+            SELECT id, canonical_key, observation_type, statement, scope_kind,
+              repo_path, repo_remote, branch, workspace_path, proof_count,
+              confidence, freshness, contradiction_count, last_verified_at,
+              valid_from, valid_to, status, updated_at
+            FROM observations
+            WHERE canonical_key = ?1
+            LIMIT 1
+            ",
+            params![&canonical_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup observation: {}", e)))?;
+
+    let (
+        observation_id,
+        canonical_key,
+        observation_type,
+        statement,
+        scope_kind,
+        repo_path,
+        repo_remote,
+        branch,
+        workspace_path,
+        proof_count,
+        confidence,
+        freshness,
+        contradiction_count,
+        last_verified_at,
+        valid_from,
+        valid_to,
+        status,
+        updated_at,
+    ) = row.ok_or_else(|| ApiError::not_found("observation not found"))?;
+
+    Ok(Json(ObservationViewResponse {
+        memory_item_ids: load_observation_memory_ids(&conn, &observation_id)?,
+        evidence_record_ids: load_observation_evidence_ids(&conn, &observation_id)?,
+        observation_id,
+        canonical_key,
+        observation_type,
+        statement,
+        scope_kind,
+        repo_path,
+        repo_remote,
+        branch,
+        workspace_path,
+        proof_count,
+        confidence,
+        freshness,
+        contradiction_count,
+        last_verified_at,
+        valid_from,
+        valid_to,
+        status,
+        updated_at,
+    }))
+}
+
+async fn get_observation_history(
+    State(state): State<AppState>,
+    Path(canonical_key): Path<String>,
+) -> Result<Json<ObservationHistoryResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+    let observation_id: String = conn
+        .query_row(
+            "SELECT id FROM observations WHERE canonical_key = ?1 LIMIT 1",
+            params![&canonical_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup observation: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("observation not found"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, event_type, memory_item_id, previous_json, current_json,
+              evidence_record_ids_json, created_at
+            FROM observation_events
+            WHERE observation_id = ?1
+            ORDER BY created_at DESC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare observation history: {}", e)))?;
+
+    let rows = stmt
+        .query_map(params![&observation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|e| ApiError::internal(format!("failed to query observation history: {}", e)))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            event_id,
+            event_type,
+            memory_item_id,
+            previous_raw,
+            current_raw,
+            evidence_raw,
+            created_at,
+        ) = row
+            .map_err(|e| ApiError::internal(format!("failed to read observation event: {}", e)))?;
+        events.push(ObservationEventEntry {
+            event_id,
+            event_type,
+            memory_item_id,
+            previous_json: previous_raw
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(|e| {
+                    ApiError::internal(format!("failed to decode observation previous_json: {}", e))
+                })?,
+            current_json: serde_json::from_str(&current_raw).map_err(|e| {
+                ApiError::internal(format!("failed to decode observation current_json: {}", e))
+            })?,
+            evidence_record_ids: serde_json::from_str(&evidence_raw).map_err(|e| {
+                ApiError::internal(format!("failed to decode observation evidence ids: {}", e))
+            })?,
+            created_at,
+        });
+    }
+
+    Ok(Json(ObservationHistoryResponse {
+        observation_id,
+        canonical_key,
+        events,
     }))
 }
 
@@ -3476,6 +3857,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0007_observation_canonical_keys.sql"
     ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0008_observation_events.sql"
+    ))?;
     Ok(())
 }
 
@@ -3586,7 +3970,7 @@ mod tests {
                 "
                 SELECT canonical_key, statement, proof_count, confidence
                 FROM observations
-                WHERE id = 'observation-project-storage'
+                WHERE id = 'observation-decision-project-storage'
                 ",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -3602,7 +3986,7 @@ mod tests {
                 "
                 SELECT COUNT(*)
                 FROM observation_evidence_links
-                WHERE observation_id = 'observation-project-storage'
+                WHERE observation_id = 'observation-decision-project-storage'
                 ",
                 [],
                 |row| row.get(0),
@@ -3616,7 +4000,7 @@ mod tests {
                 SELECT COUNT(*)
                 FROM retrieval_documents_fts
                 WHERE source_type = 'observation'
-                  AND source_id = 'observation-project-storage'
+                  AND source_id = 'observation-decision-project-storage'
                   AND retrieval_documents_fts MATCH 'sqlite'
                 ",
                 [],
@@ -3659,7 +4043,7 @@ mod tests {
                   confidence,
                   freshness
                 FROM observations
-                WHERE id = 'observation-project-storage'
+                WHERE id = 'observation-decision-project-storage'
                 ",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -3699,7 +4083,7 @@ mod tests {
                 "
                 SELECT contradiction_count, freshness, confidence
                 FROM observations
-                WHERE id = 'observation-project-storage'
+                WHERE id = 'observation-decision-project-storage'
                 ",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -3708,6 +4092,31 @@ mod tests {
         assert_eq!(contradiction_count, 1);
         assert_eq!(weakening_freshness, "weakening");
         assert_eq!(weakened_confidence, 0.8);
+
+        let mut event_types: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "
+                    SELECT event_type
+                    FROM observation_events
+                    WHERE observation_id = 'observation-decision-project-storage'
+                    ",
+                )
+                .expect("event query should prepare");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("event query should run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("event rows should read")
+        };
+        event_types.sort();
+        assert_eq!(
+            event_types,
+            vec![
+                "contradicted".to_string(),
+                "created".to_string(),
+                "strengthened".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -3906,6 +4315,10 @@ mod tests {
             "../../../db/migrations/0007_observation_canonical_keys.sql"
         ))
         .expect("observation canonical indexes should apply");
+        conn.execute_batch(include_str!(
+            "../../../db/migrations/0008_observation_events.sql"
+        ))
+        .expect("observation event migration should apply");
         conn
     }
 

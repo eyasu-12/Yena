@@ -48,6 +48,11 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - added `db/migrations/0007_observation_canonical_keys.sql` for canonical observation identity
   - canonical observations now merge evidence across repeated commits to strengthen proof count
   - observation updates now classify semantic state as strengthening, weakening, or contradicted using statement similarity, proof count, confidence, and freshness
+  - added `db/migrations/0008_observation_events.sql` for compiled observation event history
+  - observation updates now append event records with previous/current compiled state and linked evidence IDs
+  - compiler read APIs now expose active observations and observation history:
+    - `GET /v1/observations/{canonical_key}`
+    - `GET /v1/observations/{canonical_key}/history`
 - Extended retrieval v2 scoring:
   - loads local SQLite FTS scores from `retrieval_documents_fts`
   - can retrieve concise memory answers through richer indexed documents
@@ -70,6 +75,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - `benchmarks/load_developer_memory_seed.py`
   - `benchmarks/run_developer_memory_benchmark.py`
   - fixture loader now creates canonical compiled observations and observation FTS documents
+  - fixture loader now creates synthetic observation event history for loaded benchmark observations
   - validates answer kind, inclusions/exclusions, evidence IDs, redactions, and abstention reason against `/v2/retrieve`
 - Created ongoing backlog file:
   - `TODOS.md`

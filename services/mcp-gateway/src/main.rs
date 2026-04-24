@@ -1767,6 +1767,9 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0007_observation_canonical_keys.sql"
     ))?;
+    conn.execute_batch(include_str!(
+        "../../../db/migrations/0008_observation_events.sql"
+    ))?;
     Ok(())
 }
 

@@ -9,7 +9,7 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
 3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
-4. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence; updates are classified as strengthening, weakening, or contradicted.
+4. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence; updates are classified as strengthening, weakening, or contradicted and appended to an observation event log.
 5. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.
 6. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
 7. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
@@ -77,6 +77,18 @@ Audit event + retrieval trace
 ```
 
 The first implementation intentionally stays local-first: SQLite tables, deterministic scoring, SQLite FTS, and no required vector database.
+
+## Observation Event History
+
+Compiled observations are the first durable smart-memory layer above raw memory versions. Each update writes an `observation_events` row containing:
+
+- the canonical observation key
+- the update type: `created`, `strengthened`, `weakened`, `contradicted`, or `updated`
+- the previous compiled state when one existed
+- the current compiled state
+- the memory item and evidence IDs that caused the update
+
+This keeps observation canonicalization auditable before Yena adds richer graph reasoning or ontology-aware compaction.
 
 ## Non-Functional Requirements
 

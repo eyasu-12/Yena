@@ -36,7 +36,8 @@ def main() -> int:
     print(
         "Loaded {evidence} evidence records, {scopes} agent scopes, "
         "{policies} policies, {memory_items} memory items, {versions} versions, "
-        "{observations} observations, and {fts_documents} retrieval documents into {db}".format(
+        "{observations} observations, {observation_events} observation events, "
+        "and {fts_documents} retrieval documents into {db}".format(
             **counts,
             db=args.db,
         )
@@ -92,6 +93,7 @@ def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path) -> None:
         "0005_graph_canonicalization.sql",
         "0006_retrieval_v2_foundation.sql",
         "0007_observation_canonical_keys.sql",
+        "0008_observation_events.sql",
     ]
     for migration in ordered:
         if migration == "0004_graph_confidence.sql":
@@ -229,6 +231,7 @@ def load_memories(
     version_count = 0
     fts_count = 0
     observation_count = 0
+    observation_event_count = 0
     for canonical_key, versions in grouped.items():
         ordered_versions = sorted(versions, key=lambda item: item.get("valid_from") or "")
         active_memory = next(
@@ -319,12 +322,14 @@ def load_memories(
             scope,
         )
         observation_count += 1
+        observation_event_count += 1
         fts_count += 2
 
     return {
         "memory_items": memory_item_count,
         "versions": version_count,
         "observations": observation_count,
+        "observation_events": observation_event_count,
         "fts_documents": fts_count,
     }
 
@@ -407,7 +412,7 @@ def upsert_observation(
     scope: dict[str, str | None],
 ) -> None:
     observation_key = f"{normalize_token(require(memory, 'memory_type'))}:{canonical_key.strip()}"
-    observation_id = f"observation-{stable_key_fragment(canonical_key)}"
+    observation_id = f"observation-{stable_key_fragment(observation_key)}"
     statement = statement_for(memory)
     evidence_ids = memory.get("evidence_ids", [])
     conn.execute(
@@ -503,6 +508,32 @@ def upsert_observation(
             scope["branch"],
             canonical_key,
             body,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO observation_events (
+          id, observation_id, canonical_key, event_type, memory_item_id,
+          previous_json, current_json, evidence_record_ids_json, created_at
+        ) VALUES (?, ?, ?, 'loaded', ?, NULL, ?, ?, ?)
+        """,
+        (
+            f"observation-event-{observation_id}-loaded",
+            observation_id,
+            observation_key,
+            memory_item_id,
+            json.dumps(
+                {
+                    "statement": statement,
+                    "proof_count": len(evidence_ids),
+                    "confidence": float(memory.get("confidence", 1.0)),
+                    "freshness": freshness_for(memory),
+                    "contradiction_count": 0,
+                },
+                sort_keys=True,
+            ),
+            json.dumps(sorted(evidence_ids), sort_keys=True),
+            memory.get("valid_from") or NOW,
         ),
     )
 

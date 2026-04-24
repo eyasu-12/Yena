@@ -14,7 +14,7 @@ Runners should treat `answer_kind = abstain` as a requirement to avoid unsupport
 
 ## Load Fixtures
 
-`load_developer_memory_seed.py` creates a local Yena SQLite database from the seed file. It applies the project migrations, inserts evidence, agent scopes, redaction policy, memory versions, metadata, canonical compiled observations, links, and retrieval FTS documents.
+`load_developer_memory_seed.py` creates a local Yena SQLite database from the seed file. It applies the project migrations, inserts evidence, agent scopes, redaction policy, memory versions, metadata, canonical compiled observations, observation event history, links, and retrieval FTS documents.
 
 ```sh
 python3 benchmarks/load_developer_memory_seed.py \
