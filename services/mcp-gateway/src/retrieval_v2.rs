@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -37,6 +37,7 @@ struct RankedCandidate {
     candidate: Candidate,
     matched_terms: Vec<String>,
     score: f64,
+    fts_score: Option<f64>,
 }
 
 pub(crate) fn retrieve(
@@ -45,7 +46,8 @@ pub(crate) fn retrieve(
 ) -> anyhow::Result<MemoryAnswerContract> {
     let terms = tokenize_query(&input.query);
     let all_candidates = load_candidates(conn, &input.allowed_memory_types)?;
-    let matching_candidates = match_candidates(all_candidates, &terms);
+    let fts_scores = load_fts_scores(conn, &terms)?;
+    let matching_candidates = match_candidates(all_candidates, &terms, &fts_scores);
     let mut scoped = matching_candidates
         .iter()
         .filter(|ranked| scope_matches(&input.scope, &ranked.candidate.scope))
@@ -57,6 +59,9 @@ pub(crate) fn retrieve(
     }
     if scoped.is_empty() {
         return Ok(abstain(input, AbstentionReason::OutOfScope));
+    }
+    if scoped.iter().all(|r| r.candidate.evidence_refs.is_empty()) {
+        return Ok(abstain(input, AbstentionReason::MissingEvidence));
     }
     if scoped
         .iter()
@@ -324,10 +329,66 @@ fn load_graph_candidates(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-fn match_candidates(candidates: Vec<Candidate>, terms: &[String]) -> Vec<RankedCandidate> {
+fn load_fts_scores(
+    conn: &Connection,
+    terms: &[String],
+) -> anyhow::Result<BTreeMap<(String, String), f64>> {
+    let Some(query) = build_fts_query(terms) else {
+        return Ok(BTreeMap::new());
+    };
+
+    let mut stmt = conn.prepare(
+        "
+        SELECT source_type, source_id, bm25(retrieval_documents_fts) AS rank
+        FROM retrieval_documents_fts
+        WHERE retrieval_documents_fts MATCH ?1
+        ORDER BY rank
+        LIMIT 200
+        ",
+    )?;
+    let rows = stmt.query_map([query], |row| {
+        Ok((
+            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+
+    let mut scores = BTreeMap::new();
+    for (rank, row) in rows.enumerate() {
+        let (key, bm25) = row?;
+        // SQLite FTS5 bm25 values are lower-is-better. Preserve that signal but
+        // also add an ordinal boost so exact FTS hits can surface even when the
+        // candidate statement is intentionally concise.
+        let normalized = 25.0 + (200usize.saturating_sub(rank) as f64 * 0.05) - bm25.abs();
+        scores.insert(key, normalized);
+    }
+    Ok(scores)
+}
+
+fn build_fts_query(terms: &[String]) -> Option<String> {
+    let terms = terms
+        .iter()
+        .filter(|term| term.chars().any(|c| c.is_alphanumeric()))
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+fn match_candidates(
+    candidates: Vec<Candidate>,
+    terms: &[String],
+    fts_scores: &BTreeMap<(String, String), f64>,
+) -> Vec<RankedCandidate> {
     candidates
         .into_iter()
         .filter_map(|candidate| {
+            let fts_score = fts_scores
+                .get(&(candidate.source.clone(), candidate.id.clone()))
+                .copied();
             let haystack = format!(
                 "{} {} {}",
                 candidate.statement, candidate.memory_type, candidate.value_json
@@ -338,7 +399,7 @@ fn match_candidates(candidates: Vec<Candidate>, terms: &[String]) -> Vec<RankedC
                 .filter(|term| haystack.contains(term.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            if matched_terms.is_empty() {
+            if matched_terms.is_empty() && fts_score.is_none() {
                 return None;
             }
             let freshness_boost = match candidate.freshness {
@@ -351,11 +412,13 @@ fn match_candidates(candidates: Vec<Candidate>, terms: &[String]) -> Vec<RankedC
             let score = (matched_terms.len() as f64 * 10.0)
                 + candidate.confidence as f64
                 + freshness_boost
-                + (candidate.evidence_refs.len() as f64 * 0.1);
+                + (candidate.evidence_refs.len() as f64 * 0.1)
+                + fts_score.unwrap_or(0.0);
             Some(RankedCandidate {
                 candidate,
                 matched_terms,
                 score,
+                fts_score,
             })
         })
         .collect()
@@ -374,6 +437,7 @@ fn build_answer(
         matched_terms: ranked.matched_terms.clone(),
         score_components: json!({
             "rank_score": ranked.score,
+            "fts_score": ranked.fts_score,
             "confidence": ranked.candidate.confidence,
             "freshness": ranked.candidate.freshness,
             "evidence_count": ranked.candidate.evidence_refs.len(),
@@ -630,6 +694,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fts_match_can_surface_concise_candidate() {
+        let conn = test_conn();
+        seed_memory(
+            &conn,
+            "mem-storage",
+            "ver-storage",
+            "project_decision",
+            "decision:storage",
+            json!({"statement":"Yena storage decision"}),
+            "global",
+            None,
+            None,
+            None,
+            "stable",
+            0.9,
+        );
+        conn.execute(
+            "
+            INSERT INTO retrieval_documents_fts (
+              source_type, source_id, scope_kind, title, body
+            ) VALUES ('memory_item', 'mem-storage', 'global', 'decision:storage', 'sqlite embedded durable local database')
+            ",
+            [],
+        )
+        .expect("FTS document should insert");
+
+        let answer = retrieve(
+            &conn,
+            input(
+                "Which durable database did we choose?",
+                global_scope(),
+                true,
+            ),
+        )
+        .expect("retrieval should run");
+
+        assert!(!answer.should_abstain);
+        assert_eq!(answer.memories[0].statement, "Yena storage decision");
+        assert!(answer.memories[0]
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.score_components.get("fts_score"))
+            .is_some());
+    }
+
     fn input(query: &str, scope: RetrievalScope, include_trace: bool) -> RetrievalV2Input {
         RetrievalV2Input {
             query: query.to_string(),
@@ -707,6 +817,27 @@ mod tests {
             params![version_id, memory_id, serde_json::to_string(&value_json).expect("value should encode"), now],
         )
         .expect("memory version should insert");
+        let evidence_id = format!("evidence-{memory_id}");
+        conn.execute(
+            "INSERT INTO evidence_records (id, source_type, source_ref, content_type, content, created_at, ingested_at, checksum) VALUES (?1, 'test', ?2, 'text/plain', 'test evidence', ?3, ?3, ?4)",
+            params![
+                evidence_id,
+                format!("test://{memory_id}"),
+                now,
+                format!("sha256:{memory_id}"),
+            ],
+        )
+        .expect("evidence should insert");
+        conn.execute(
+            "INSERT INTO memory_links (id, memory_item_version_id, evidence_record_id, link_type, created_at) VALUES (?1, ?2, ?3, 'supporting_evidence', ?4)",
+            params![
+                format!("link-{memory_id}"),
+                version_id,
+                evidence_id,
+                now,
+            ],
+        )
+        .expect("memory link should insert");
         conn.execute(
             "INSERT INTO memory_item_metadata (memory_item_id, scope_kind, repo_path, repo_remote, branch, workspace_path, sensitivity, freshness, confidence, decay_policy, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'normal', ?6, ?7, NULL, ?8, ?8)",
             params![memory_id, scope_kind, repo_path, repo_remote, branch, freshness, confidence, now],

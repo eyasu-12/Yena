@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tracing::info;
@@ -32,6 +32,8 @@ struct CreateProposalRequest {
     value_json: Value,
     #[serde(default)]
     evidence_record_ids: Vec<String>,
+    scope: Option<MemoryScopePayload>,
+    freshness: Option<String>,
     confidence: f32,
 }
 
@@ -69,6 +71,19 @@ struct ProposalPayload {
     memory_type: String,
     value_json: Value,
     evidence_record_ids: Vec<String>,
+    #[serde(default)]
+    scope: Option<MemoryScopePayload>,
+    #[serde(default)]
+    freshness: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct MemoryScopePayload {
+    kind: Option<String>,
+    repo_path: Option<String>,
+    repo_remote: Option<String>,
+    branch: Option<String>,
+    workspace_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -645,6 +660,8 @@ async fn create_proposal(
         memory_type: payload.memory_type,
         value_json: payload.value_json,
         evidence_record_ids: payload.evidence_record_ids,
+        scope: payload.scope,
+        freshness: payload.freshness,
     };
     let payload_json = serde_json::to_string(&proposal_payload)
         .map_err(|e| ApiError::internal(format!("failed to encode proposal payload: {}", e)))?;
@@ -776,6 +793,23 @@ async fn commit_proposal(
     )
     .map_err(|e| ApiError::internal(format!("failed to update memory item: {}", e)))?;
 
+    upsert_memory_metadata(
+        &tx,
+        &memory_item_id,
+        payload.scope.as_ref(),
+        payload.freshness.as_deref(),
+        proposal.confidence,
+        &committed_at,
+    )?;
+    upsert_memory_fts_document(
+        &tx,
+        &memory_item_id,
+        &proposal.subject_key,
+        &payload.memory_type,
+        &payload.value_json,
+        payload.scope.as_ref(),
+    )?;
+
     tx.execute(
         "
         UPDATE memory_proposals
@@ -796,6 +830,196 @@ async fn commit_proposal(
         superseded_version_id: old_active_version_id,
         committed_at,
     }))
+}
+
+fn upsert_memory_metadata(
+    tx: &Transaction<'_>,
+    memory_item_id: &str,
+    scope: Option<&MemoryScopePayload>,
+    freshness: Option<&str>,
+    confidence: f32,
+    updated_at: &str,
+) -> Result<(), ApiError> {
+    let scope_kind = scope
+        .and_then(|s| s.kind.as_deref())
+        .map(normalize_scope_kind)
+        .unwrap_or_else(|| "global".to_string());
+    let freshness = freshness
+        .map(normalize_freshness)
+        .unwrap_or_else(|| "stable".to_string());
+    let repo_path = scope.and_then(|s| trim_scope_field(s.repo_path.as_deref()));
+    let repo_remote = scope.and_then(|s| trim_scope_field(s.repo_remote.as_deref()));
+    let branch = scope.and_then(|s| trim_scope_field(s.branch.as_deref()));
+    let workspace_path = scope.and_then(|s| trim_scope_field(s.workspace_path.as_deref()));
+
+    tx.execute(
+        "
+        INSERT INTO memory_item_metadata (
+          memory_item_id, scope_kind, repo_path, repo_remote, branch, workspace_path,
+          sensitivity, freshness, confidence, decay_policy, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'normal', ?7, ?8, NULL, ?9, ?9)
+        ON CONFLICT(memory_item_id) DO UPDATE SET
+          scope_kind = excluded.scope_kind,
+          repo_path = excluded.repo_path,
+          repo_remote = excluded.repo_remote,
+          branch = excluded.branch,
+          workspace_path = excluded.workspace_path,
+          freshness = excluded.freshness,
+          confidence = excluded.confidence,
+          updated_at = excluded.updated_at
+        ",
+        params![
+            memory_item_id,
+            scope_kind,
+            repo_path,
+            repo_remote,
+            branch,
+            workspace_path,
+            freshness,
+            confidence,
+            updated_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to upsert memory metadata: {}", e)))?;
+    Ok(())
+}
+
+fn upsert_memory_fts_document(
+    tx: &Transaction<'_>,
+    memory_item_id: &str,
+    canonical_key: &str,
+    memory_type: &str,
+    value_json: &Value,
+    scope: Option<&MemoryScopePayload>,
+) -> Result<(), ApiError> {
+    let scope_kind = scope
+        .and_then(|s| s.kind.as_deref())
+        .map(normalize_scope_kind)
+        .unwrap_or_else(|| "global".to_string());
+    let repo_path = scope.and_then(|s| trim_scope_field(s.repo_path.as_deref()));
+    let repo_remote = scope.and_then(|s| trim_scope_field(s.repo_remote.as_deref()));
+    let branch = scope.and_then(|s| trim_scope_field(s.branch.as_deref()));
+    let body = format!(
+        "{} {} {}",
+        memory_type,
+        canonical_key,
+        serde_json::to_string(value_json)
+            .map_err(|e| ApiError::internal(format!("failed to encode memory FTS body: {}", e)))?
+    );
+
+    upsert_retrieval_document(
+        tx,
+        "memory_item",
+        memory_item_id,
+        &scope_kind,
+        repo_path.as_deref(),
+        repo_remote.as_deref(),
+        branch.as_deref(),
+        canonical_key,
+        &body,
+    )
+}
+
+fn upsert_graph_fts_document(
+    tx: &Transaction<'_>,
+    relationship_id: &str,
+    canonical_key: &str,
+    subject: &GraphEntityRef,
+    predicate: &str,
+    object: &GraphEntityRef,
+    attributes_json: &Value,
+) -> Result<(), ApiError> {
+    let body = format!(
+        "{} {} {} {} {} {}",
+        subject.entity_type,
+        subject.canonical_name,
+        predicate,
+        object.entity_type,
+        object.canonical_name,
+        serde_json::to_string(attributes_json)
+            .map_err(|e| ApiError::internal(format!("failed to encode graph FTS body: {}", e)))?
+    );
+    upsert_retrieval_document(
+        tx,
+        "graph_relationship",
+        relationship_id,
+        "global",
+        None,
+        None,
+        None,
+        canonical_key,
+        &body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_retrieval_document(
+    tx: &Transaction<'_>,
+    source_type: &str,
+    source_id: &str,
+    scope_kind: &str,
+    repo_path: Option<&str>,
+    repo_remote: Option<&str>,
+    branch: Option<&str>,
+    title: &str,
+    body: &str,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "
+        DELETE FROM retrieval_documents_fts
+        WHERE source_type = ?1 AND source_id = ?2
+        ",
+        params![source_type, source_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to clear retrieval FTS document: {}", e)))?;
+    tx.execute(
+        "
+        INSERT INTO retrieval_documents_fts (
+          source_type, source_id, scope_kind, repo_path, repo_remote, branch, title, body
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            source_type,
+            source_id,
+            scope_kind,
+            repo_path,
+            repo_remote,
+            branch,
+            title,
+            body,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to index retrieval FTS document: {}", e)))?;
+    Ok(())
+}
+
+fn normalize_scope_kind(kind: &str) -> String {
+    match kind.trim().to_lowercase().as_str() {
+        "repo" => "repo",
+        "workspace" => "workspace",
+        "agent" => "agent",
+        "source" => "source",
+        _ => "global",
+    }
+    .to_string()
+}
+
+fn normalize_freshness(freshness: &str) -> String {
+    match freshness.trim().to_lowercase().as_str() {
+        "new" => "new",
+        "strengthening" => "strengthening",
+        "weakening" => "weakening",
+        "stale" => "stale",
+        _ => "stable",
+    }
+    .to_string()
+}
+
+fn trim_scope_field(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 async fn reject_proposal(
@@ -1223,6 +1447,16 @@ async fn commit_graph_relationship_proposal(
         params![&relationship_id, &new_version_id, &committed_at],
     )
     .map_err(|e| ApiError::internal(format!("failed to update graph relationship: {}", e)))?;
+
+    upsert_graph_fts_document(
+        &tx,
+        &relationship_id,
+        &canonical_key,
+        &payload.subject,
+        &canonical_predicate,
+        &payload.object,
+        &payload.attributes_json,
+    )?;
 
     tx.execute(
         "
@@ -2902,6 +3136,8 @@ mod tests {
             memory_type: "preference".to_string(),
             value_json: json!({"value":"Rust"}),
             evidence_record_ids: vec![],
+            scope: None,
+            freshness: None,
             confidence: 1.1,
         };
 

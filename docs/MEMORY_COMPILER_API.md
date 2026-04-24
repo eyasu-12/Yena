@@ -25,9 +25,18 @@ Request:
   "memory_type": "preference",
   "value_json": { "value": "Rust" },
   "evidence_record_ids": ["uuid"],
+  "scope": {
+    "kind": "repo",
+    "repo_path": "/Users/eyasu/Projects/Yena",
+    "repo_remote": "https://github.com/eyasu-12/Yena.git",
+    "branch": "main"
+  },
+  "freshness": "stable",
   "confidence": 0.92
 }
 ```
+
+`scope` and `freshness` are optional. If omitted, committed memory defaults to global scope and stable freshness.
 
 Response `201`:
 
@@ -49,6 +58,8 @@ Behavior:
 - Creates a new active memory version.
 - Supersedes previous active version when present.
 - Links provided evidence records.
+- Upserts retrieval metadata with proposal confidence, scope, and freshness.
+- Re-indexes the active memory into `retrieval_documents_fts` for retrieval v2.
 - Marks proposal as `committed`.
 
 Response `200`:

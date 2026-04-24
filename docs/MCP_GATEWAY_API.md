@@ -139,6 +139,8 @@ Retrieve governed developer memory using the retrieval v2 answer contract.
 
 This endpoint is the vertical-slice foundation for Yena's core memory engine. It uses a shared retrieval pipeline over active memory items, observations, and graph relationships, then returns either scoped memory answers or a calibrated abstention.
 
+Retrieval v2 blends deterministic term matching with the local SQLite FTS index populated by the memory compiler. FTS hits can surface concise canonical memories when the richer indexed document matches the query.
+
 Request:
 
 ```json
@@ -190,7 +192,8 @@ Response:
           "candidate_id": "memory-id",
           "matched_terms": ["sqlite"],
           "score_components": {
-            "rank_score": 10.91,
+            "rank_score": 35.91,
+            "fts_score": 25,
             "confidence": 0.91,
             "freshness": "stable",
             "evidence_count": 1

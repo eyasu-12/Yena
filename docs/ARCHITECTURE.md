@@ -9,10 +9,11 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
 3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
-4. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
-5. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
-6. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
-7. Audit: every retrieval and redaction is logged.
+4. Retrieval Indexing: committed memory and graph relationships are projected into a local SQLite FTS index.
+5. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
+6. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
+7. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
+8. Audit: every retrieval and redaction is logged.
 
 ## Modules
 
@@ -46,10 +47,12 @@ Candidate sources
   |-- memory_items + memory_item_versions + memory_item_metadata
   |-- observations + observation evidence/memory links
   |-- graph_relationships + active versions
+  |-- retrieval_documents_fts
   |
   v
 Rank fusion foundation
   |-- query term matches
+  |-- SQLite FTS/BM25 signal
   |-- confidence
   |-- freshness
   |-- evidence count
@@ -68,7 +71,7 @@ Trace redaction gate
 Audit event + retrieval trace
 ```
 
-The first implementation intentionally stays local-first: SQLite tables, deterministic scoring, and no required vector database.
+The first implementation intentionally stays local-first: SQLite tables, deterministic scoring, SQLite FTS, and no required vector database.
 
 ## Non-Functional Requirements
 
