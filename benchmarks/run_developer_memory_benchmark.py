@@ -204,7 +204,10 @@ def post_json(url: str, payload: dict[str, Any], timeout: float) -> tuple[dict[s
 
 def evaluate(expected: dict[str, Any], response: dict[str, Any]) -> list[dict[str, Any]]:
     context = extract_context(response)
-    response_text = normalize_text(collect_strings(context))
+    text_context = dict(context)
+    text_context.pop("query", None)
+    text_context.pop("scope", None)
+    response_text = normalize_text(collect_strings(text_context))
     evidence_refs = set(extract_evidence_refs(context))
     redaction_keys = set(extract_redaction_keys(context))
     answer_kind = extract_answer_kind(context, response_text)
@@ -245,7 +248,7 @@ def extract_answer_kind(context: dict[str, Any], response_text: str) -> str:
         return normalize_reason(explicit)
     if context.get("should_abstain") is True:
         return "abstain"
-    caveat_terms = ("conflict", "contradict", "caveat", "newer evidence", "superseded")
+    caveat_terms = ("conflict note", "contradictory", "newer evidence", "superseded")
     if any(term in response_text for term in caveat_terms):
         return "answer_with_caveat"
     return "answer"

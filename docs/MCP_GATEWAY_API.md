@@ -192,8 +192,8 @@ Response:
           "candidate_id": "memory-id",
           "matched_terms": ["sqlite"],
           "score_components": {
-            "rank_score": 35.91,
-            "fts_score": 25,
+            "rank_score": 15.91,
+            "fts_score": 5,
             "confidence": 0.91,
             "freshness": "stable",
             "evidence_count": 1
@@ -219,6 +219,7 @@ Abstention response:
     "scope": { "kind": "global" },
     "should_abstain": true,
     "abstention_reason": "missing_evidence",
+    "abstention_message": "The requested fact is not selected in Yena yet; it remains an open question without supporting evidence.",
     "memories": []
   }
 }
@@ -228,9 +229,12 @@ Abstention reasons:
 
 - `missing_evidence`
 - `stale_memory`
+- `stale_memory_superseded`
 - `contradicted`
 - `out_of_scope`
 - `low_confidence`
+
+Some abstentions can include supporting memories. For example, stale/superseded decision checks may return the current active memory and its evidence while still setting `should_abstain = true`.
 
 Every retrieval v2 call writes:
 

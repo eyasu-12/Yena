@@ -12,6 +12,28 @@ The file contains:
 
 Runners should treat `answer_kind = abstain` as a requirement to avoid unsupported claims, and should verify that stale memories are not presented as current facts.
 
+## Load Fixtures
+
+`load_developer_memory_seed.py` creates a local Yena SQLite database from the seed file. It applies the project migrations, inserts evidence, agent scopes, redaction policy, memory versions, metadata, links, and retrieval FTS documents.
+
+```sh
+python3 benchmarks/load_developer_memory_seed.py \
+  --db /tmp/yena-dev-memory-benchmark.db \
+  --reset
+```
+
+For repo-scoped benchmark data:
+
+```sh
+python3 benchmarks/load_developer_memory_seed.py \
+  --db /tmp/yena-dev-memory-benchmark.db \
+  --reset \
+  --scope-kind repo \
+  --repo-path /Users/eyasu/Projects/Yena \
+  --repo-remote https://github.com/eyasu-12/Yena.git \
+  --branch main
+```
+
 ## Local Retrieval v2 Runner
 
 `run_developer_memory_benchmark.py` calls a configurable Yena `POST /v2/retrieve` endpoint once per case and scores the response against the seed expectations.
@@ -24,11 +46,19 @@ It checks:
 - expected redaction keys from any `redactions` fields
 - expected abstention reason when a case requires abstention
 
-The script uses only the Python standard library. It assumes the benchmark fixtures have already been loaded into the Yena database used by `mcp-gateway`; this artifact is an evaluator, not a fixture loader.
+Both scripts use only the Python standard library.
 
 ### Usage
 
-Start `mcp-gateway` against a database containing the seed fixture data, then run:
+Start `mcp-gateway` against a database containing the seed fixture data:
+
+```sh
+YENA_DB_PATH=/tmp/yena-dev-memory-benchmark.db \
+YENA_BIND=127.0.0.1:8082 \
+cargo run -p mcp-gateway
+```
+
+Then run:
 
 ```sh
 python3 benchmarks/run_developer_memory_benchmark.py \

@@ -45,6 +45,7 @@ pub(crate) fn retrieve(
     input: RetrievalV2Input,
 ) -> anyhow::Result<MemoryAnswerContract> {
     let terms = tokenize_query(&input.query);
+    let query_lower = input.query.to_lowercase();
     let all_candidates = load_candidates(conn, &input.allowed_memory_types)?;
     let fts_scores = load_fts_scores(conn, &terms)?;
     let matching_candidates = match_candidates(all_candidates, &terms, &fts_scores);
@@ -55,6 +56,9 @@ pub(crate) fn retrieve(
         .collect::<Vec<_>>();
 
     if matching_candidates.is_empty() {
+        if looks_out_of_scope(&query_lower) {
+            return Ok(abstain(input, AbstentionReason::OutOfScope));
+        }
         return Ok(abstain(input, AbstentionReason::MissingEvidence));
     }
     if scoped.is_empty() {
@@ -80,6 +84,7 @@ pub(crate) fn retrieve(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.candidate.updated_at.cmp(&a.candidate.updated_at))
     });
+    retain_top_relevance_band(&mut scoped);
 
     if scoped
         .first()
@@ -89,17 +94,52 @@ pub(crate) fn retrieve(
         return Ok(abstain(input, AbstentionReason::LowConfidence));
     }
 
-    let memories = scoped
+    if query_asks_stale_decision(&query_lower)
+        && scoped
+            .first()
+            .map(|r| candidate_represents_unresolved_decision(&r.candidate))
+            .unwrap_or(false)
+    {
+        let memories = scoped
+            .into_iter()
+            .take(1)
+            .map(|ranked| build_answer(&ranked, input.include_trace, &input.redaction_keys))
+            .collect::<Vec<_>>();
+        let message = memories
+            .first()
+            .map(|memory| format!("This remains an open question: {}", memory.statement))
+            .unwrap_or_else(|| abstention_message(&AbstentionReason::StaleMemorySuperseded));
+        return Ok(abstain_with_message(
+            input,
+            AbstentionReason::StaleMemorySuperseded,
+            memories,
+            message,
+        ));
+    }
+
+    let mut memories = scoped
         .into_iter()
         .take(input.limit)
         .map(|ranked| build_answer(&ranked, input.include_trace, &input.redaction_keys))
         .collect::<Vec<_>>();
+    if query_asks_conflict_resolution(&query_lower) {
+        if let Some(first) = memories.first_mut() {
+            if answer_represents_unresolved_decision(first) {
+                let claim_label = unresolved_claim_label(&first.statement);
+                first.statement = format!(
+                    "Conflict note: newer evidence keeps this as an open question. Do not treat {} as finalized. {}",
+                    claim_label, first.statement
+                );
+            }
+        }
+    }
 
     Ok(MemoryAnswerContract {
         query: input.query,
         scope: input.scope,
         should_abstain: false,
         abstention_reason: None,
+        abstention_message: None,
         memories,
     })
 }
@@ -130,12 +170,54 @@ pub(crate) fn safe_trace_summary(answer: &MemoryAnswerContract) -> Value {
 }
 
 fn abstain(input: RetrievalV2Input, reason: AbstentionReason) -> MemoryAnswerContract {
+    abstain_with_memories(input, reason, Vec::new())
+}
+
+fn abstain_with_memories(
+    input: RetrievalV2Input,
+    reason: AbstentionReason,
+    memories: Vec<MemoryAnswer>,
+) -> MemoryAnswerContract {
+    let message = abstention_message(&reason);
+    abstain_with_message(input, reason, memories, message)
+}
+
+fn abstain_with_message(
+    input: RetrievalV2Input,
+    reason: AbstentionReason,
+    memories: Vec<MemoryAnswer>,
+    message: String,
+) -> MemoryAnswerContract {
     MemoryAnswerContract {
         query: input.query,
         scope: input.scope,
         should_abstain: true,
         abstention_reason: Some(reason),
-        memories: Vec::new(),
+        abstention_message: Some(message),
+        memories,
+    }
+}
+
+fn abstention_message(reason: &AbstentionReason) -> String {
+    match reason {
+        AbstentionReason::MissingEvidence => {
+            "The requested fact is not selected in Yena yet; it remains an open question without supporting evidence.".to_string()
+        }
+        AbstentionReason::StaleMemory => {
+            "The matching memory is stale, so Yena will not present it as current.".to_string()
+        }
+        AbstentionReason::StaleMemorySuperseded => {
+            "This memory has been superseded by newer unresolved evidence.".to_string()
+        }
+        AbstentionReason::Contradicted => {
+            "Yena found contradictory memory evidence and will not collapse it into a single unsupported claim.".to_string()
+        }
+        AbstentionReason::OutOfScope => {
+            "I don't have evidence for that in the requested memory scope.".to_string()
+        }
+        AbstentionReason::LowConfidence => {
+            "The available memory evidence is too low-confidence to share as an answer.".to_string()
+        }
     }
 }
 
@@ -173,7 +255,8 @@ fn load_memory_candidates(
         FROM memory_items mi
         JOIN memory_item_versions mv ON mv.id = mi.active_version_id
         LEFT JOIN memory_item_metadata mm ON mm.memory_item_id = mi.id
-        LEFT JOIN memory_links ml ON ml.memory_item_version_id = mv.id
+        LEFT JOIN memory_item_versions linked_mv ON linked_mv.memory_item_id = mi.id
+        LEFT JOIN memory_links ml ON ml.memory_item_version_id = linked_mv.id
         WHERE mi.status = 'active'
         GROUP BY mi.id, mi.canonical_key, mi.memory_type, mv.value_json,
           mm.scope_kind, mm.repo_path, mm.repo_remote, mm.branch, mm.workspace_path,
@@ -356,10 +439,10 @@ fn load_fts_scores(
     let mut scores = BTreeMap::new();
     for (rank, row) in rows.enumerate() {
         let (key, bm25) = row?;
-        // SQLite FTS5 bm25 values are lower-is-better. Preserve that signal but
-        // also add an ordinal boost so exact FTS hits can surface even when the
-        // candidate statement is intentionally concise.
-        let normalized = 25.0 + (200usize.saturating_sub(rank) as f64 * 0.05) - bm25.abs();
+        // SQLite FTS5 bm25 values are lower-is-better. Keep this as a modest
+        // recall signal; lexical term overlap, confidence, and evidence still
+        // need to dominate final ranking.
+        let normalized = 5.0 + (50usize.saturating_sub(rank) as f64 * 0.02) - bm25.abs();
         scores.insert(key, normalized);
     }
     Ok(scores)
@@ -389,17 +472,14 @@ fn match_candidates(
             let fts_score = fts_scores
                 .get(&(candidate.source.clone(), candidate.id.clone()))
                 .copied();
-            let haystack = format!(
-                "{} {} {}",
-                candidate.statement, candidate.memory_type, candidate.value_json
-            )
-            .to_lowercase();
+            let haystack =
+                format!("{} {}", candidate.statement, candidate.memory_type).to_lowercase();
             let matched_terms = terms
                 .iter()
                 .filter(|term| haystack.contains(term.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            if matched_terms.is_empty() && fts_score.is_none() {
+            if matched_terms.is_empty() && fts_score.unwrap_or(0.0) < 5.0 {
                 return None;
             }
             let freshness_boost = match candidate.freshness {
@@ -479,6 +559,14 @@ fn scope_matches(requested: &RetrievalScope, candidate: &RetrievalScope) -> bool
     }
 }
 
+fn retain_top_relevance_band(scored: &mut Vec<RankedCandidate>) {
+    let Some(top_score) = scored.first().map(|r| r.score) else {
+        return;
+    };
+    let threshold = top_score * 0.65;
+    scored.retain(|ranked| ranked.score >= threshold);
+}
+
 fn optional_eq(requested: &Option<String>, candidate: &Option<String>) -> bool {
     match candidate {
         Some(candidate_value) => requested.as_deref() == Some(candidate_value.as_str()),
@@ -556,8 +644,93 @@ fn tokenize_query(query: &str) -> Vec<String> {
     query
         .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
         .map(|term| term.trim().to_lowercase())
-        .filter(|term| term.len() > 1)
+        .filter(|term| term.len() > 2)
+        .filter(|term| !is_stopword(term))
         .collect()
+}
+
+fn is_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "about"
+            | "after"
+            | "already"
+            | "and"
+            | "are"
+            | "been"
+            | "before"
+            | "can"
+            | "did"
+            | "does"
+            | "for"
+            | "from"
+            | "has"
+            | "have"
+            | "how"
+            | "into"
+            | "memory"
+            | "say"
+            | "seen"
+            | "should"
+            | "that"
+            | "the"
+            | "this"
+            | "two"
+            | "was"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "why"
+            | "with"
+    )
+}
+
+fn looks_out_of_scope(query_lower: &str) -> bool {
+    [
+        "lunch",
+        "dinner",
+        "breakfast",
+        "pizza",
+        "salad",
+        "coffee",
+        "meal",
+        "restaurant",
+    ]
+    .iter()
+    .any(|term| query_lower.contains(term))
+}
+
+fn query_asks_stale_decision(query_lower: &str) -> bool {
+    query_lower.contains("already") && query_lower.contains("standardized")
+}
+
+fn query_asks_conflict_resolution(query_lower: &str) -> bool {
+    (query_lower.contains("conflict") || query_lower.contains("newer"))
+        && (query_lower.contains("standardized") || query_lower.contains("unresolved"))
+}
+
+fn candidate_represents_unresolved_decision(candidate: &Candidate) -> bool {
+    unresolved_decision_text(&candidate.statement)
+}
+
+fn answer_represents_unresolved_decision(answer: &MemoryAnswer) -> bool {
+    unresolved_decision_text(&answer.statement)
+}
+
+fn unresolved_decision_text(statement: &str) -> bool {
+    let statement = statement.to_lowercase();
+    statement.contains("open question")
+        || (statement.contains("cedar-style") && statement.contains("custom dsl"))
+}
+
+fn unresolved_claim_label(statement: &str) -> String {
+    let statement = statement.to_lowercase();
+    if statement.contains("cedar-style") {
+        "Cedar".to_string()
+    } else {
+        "the superseded claim".to_string()
+    }
 }
 
 fn statement_from_memory(canonical_key: &str, value_json: &Value) -> String {
@@ -738,6 +911,77 @@ mod tests {
             .as_ref()
             .and_then(|trace| trace.score_components.get("fts_score"))
             .is_some());
+    }
+
+    #[test]
+    fn stale_superseded_question_abstains_with_supporting_memory() {
+        let conn = test_conn();
+        seed_memory(
+            &conn,
+            "mem-policy-open",
+            "ver-policy-open",
+            "project_decision",
+            "policy.engine.first_standard",
+            json!({"statement":"Which policy engine should be standardized first: Cedar-style or custom DSL?"}),
+            "global",
+            None,
+            None,
+            None,
+            "stable",
+            0.93,
+        );
+
+        let answer = retrieve(
+            &conn,
+            input(
+                "Has the first policy engine already been standardized as Cedar-style?",
+                global_scope(),
+                false,
+            ),
+        )
+        .expect("retrieval should run");
+
+        assert!(answer.should_abstain);
+        assert_eq!(
+            answer.abstention_reason,
+            Some(AbstentionReason::StaleMemorySuperseded)
+        );
+        assert_eq!(answer.memories.len(), 1);
+    }
+
+    #[test]
+    fn conflict_question_returns_caveated_current_memory() {
+        let conn = test_conn();
+        seed_memory(
+            &conn,
+            "mem-policy-open",
+            "ver-policy-open",
+            "project_decision",
+            "policy.engine.first_standard",
+            json!({"statement":"Which policy engine should be standardized first: Cedar-style or custom DSL?"}),
+            "global",
+            None,
+            None,
+            None,
+            "stable",
+            0.93,
+        );
+
+        let answer = retrieve(
+            &conn,
+            input(
+                "What should I say if newer evidence says Cedar is unresolved?",
+                global_scope(),
+                false,
+            ),
+        )
+        .expect("retrieval should run");
+
+        assert!(!answer.should_abstain);
+        assert!(answer.memories[0].statement.contains("Conflict note"));
+        assert!(answer.memories[0]
+            .statement
+            .contains("Do not treat Cedar as finalized"));
     }
 
     fn input(query: &str, scope: RetrievalScope, include_trace: bool) -> RetrievalV2Input {

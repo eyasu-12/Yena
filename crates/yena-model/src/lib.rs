@@ -76,6 +76,7 @@ pub enum MemoryFreshness {
 pub enum AbstentionReason {
     MissingEvidence,
     StaleMemory,
+    StaleMemorySuperseded,
     Contradicted,
     OutOfScope,
     LowConfidence,
@@ -111,5 +112,7 @@ pub struct MemoryAnswerContract {
     pub should_abstain: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub abstention_reason: Option<AbstentionReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstention_message: Option<String>,
     pub memories: Vec<MemoryAnswer>,
 }

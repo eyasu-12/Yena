@@ -53,6 +53,8 @@ Candidate sources
 Rank fusion foundation
   |-- query term matches
   |-- SQLite FTS/BM25 signal
+  |-- stopword filtering
+  |-- top relevance band filtering
   |-- confidence
   |-- freshness
   |-- evidence count
@@ -61,6 +63,7 @@ Rank fusion foundation
 Memory Answer Contract
   |-- should_abstain
   |-- abstention_reason
+  |-- abstention_message
   |-- memories
   |-- optional trace
   |
