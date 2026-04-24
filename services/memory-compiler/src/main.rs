@@ -995,6 +995,14 @@ fn upsert_observation_for_memory(
     let branch = scope.and_then(|s| trim_scope_field(s.branch.as_deref()));
     let workspace_path = scope.and_then(|s| trim_scope_field(s.workspace_path.as_deref()));
     let proof_count = evidence_record_ids.len() as i64;
+    let prior = load_existing_observation(tx, &observation_key)?;
+    let semantics = classify_observation_update(
+        prior.as_ref(),
+        &statement,
+        proof_count,
+        confidence,
+        Some(freshness.as_str()),
+    );
 
     let changed = tx
         .execute(
@@ -1010,11 +1018,11 @@ fn upsert_observation_for_memory(
                 proof_count = ?9,
                 confidence = ?10,
                 freshness = ?11,
-                contradiction_count = 0,
-                last_verified_at = ?12,
+                contradiction_count = ?12,
+                last_verified_at = ?13,
                 valid_to = NULL,
                 status = 'active',
-                updated_at = ?12
+                updated_at = ?13
             WHERE canonical_key = ?1
             ",
             params![
@@ -1027,8 +1035,9 @@ fn upsert_observation_for_memory(
                 branch,
                 workspace_path,
                 proof_count,
-                confidence,
-                freshness,
+                semantics.confidence,
+                semantics.freshness,
+                semantics.contradiction_count,
                 updated_at,
             ],
         )
@@ -1042,7 +1051,7 @@ fn upsert_observation_for_memory(
               repo_remote, branch, workspace_path, proof_count, confidence, freshness,
               contradiction_count, last_verified_at, valid_from, valid_to, status,
               created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, ?13, NULL, 'active', ?13, ?13)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, NULL, 'active', ?14, ?14)
             ",
             params![
                 &observation_id,
@@ -1055,8 +1064,9 @@ fn upsert_observation_for_memory(
                 branch,
                 workspace_path,
                 proof_count,
-                confidence,
-                freshness,
+                semantics.confidence,
+                semantics.freshness,
+                semantics.contradiction_count,
                 updated_at,
             ],
         )
@@ -1132,6 +1142,121 @@ fn upsert_observation_for_memory(
     )?;
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ExistingObservation {
+    statement: String,
+    proof_count: i64,
+    confidence: f32,
+    contradiction_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ObservationSemantics {
+    freshness: String,
+    confidence: f32,
+    contradiction_count: i64,
+}
+
+fn load_existing_observation(
+    tx: &Transaction<'_>,
+    observation_key: &str,
+) -> Result<Option<ExistingObservation>, ApiError> {
+    tx.query_row(
+        "
+        SELECT statement, proof_count, confidence, contradiction_count
+        FROM observations
+        WHERE canonical_key = ?1
+        LIMIT 1
+        ",
+        params![observation_key],
+        |row| {
+            Ok(ExistingObservation {
+                statement: row.get(0)?,
+                proof_count: row.get(1)?,
+                confidence: row.get(2)?,
+                contradiction_count: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| ApiError::internal(format!("failed to load existing observation: {}", e)))
+}
+
+fn classify_observation_update(
+    prior: Option<&ExistingObservation>,
+    next_statement: &str,
+    next_proof_count: i64,
+    next_confidence: f32,
+    requested_freshness: Option<&str>,
+) -> ObservationSemantics {
+    let requested = requested_freshness
+        .map(normalize_freshness)
+        .unwrap_or_else(|| "stable".to_string());
+    let Some(prior) = prior else {
+        return ObservationSemantics {
+            freshness: requested,
+            confidence: next_confidence,
+            contradiction_count: 0,
+        };
+    };
+
+    let similarity = statement_similarity(&prior.statement, next_statement);
+    if similarity < 0.25 {
+        return ObservationSemantics {
+            freshness: "weakening".to_string(),
+            confidence: next_confidence.min(prior.confidence),
+            contradiction_count: prior.contradiction_count + 1,
+        };
+    }
+    if requested == "stale" || requested == "weakening" || next_confidence < prior.confidence {
+        return ObservationSemantics {
+            freshness: "weakening".to_string(),
+            confidence: next_confidence.min(prior.confidence),
+            contradiction_count: prior.contradiction_count,
+        };
+    }
+    if similarity >= 0.45 || next_proof_count > prior.proof_count {
+        return ObservationSemantics {
+            freshness: "strengthening".to_string(),
+            confidence: next_confidence.max(prior.confidence),
+            contradiction_count: prior.contradiction_count,
+        };
+    }
+
+    ObservationSemantics {
+        freshness: requested,
+        confidence: next_confidence,
+        contradiction_count: prior.contradiction_count,
+    }
+}
+
+fn statement_similarity(left: &str, right: &str) -> f32 {
+    let left_terms = observation_terms(left);
+    let right_terms = observation_terms(right);
+    if left_terms.is_empty() || right_terms.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_terms.intersection(&right_terms).count() as f32;
+    let union = left_terms.union(&right_terms).count() as f32;
+    intersection / union
+}
+
+fn observation_terms(value: &str) -> BTreeSet<String> {
+    value
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.len() > 2)
+        .filter(|term| !observation_stopword(term))
+        .collect()
+}
+
+fn observation_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "and" | "are" | "for" | "from" | "the" | "this" | "that" | "uses" | "with"
+    )
 }
 
 fn observation_id_for_canonical_key(canonical_key: &str) -> String {
@@ -3520,27 +3645,69 @@ mod tests {
         .expect("observation should strengthen");
         tx.commit().expect("second transaction should commit");
 
-        let (observation_count, strengthened_proof_count, strengthened_confidence): (
-            i64,
-            i64,
-            f32,
-        ) = conn
+        let (
+            observation_count,
+            strengthened_proof_count,
+            strengthened_confidence,
+            strengthened_freshness,
+        ): (i64, i64, f32, String) = conn
             .query_row(
                 "
                 SELECT
                   (SELECT COUNT(*) FROM observations WHERE canonical_key = 'decision:project.storage'),
                   proof_count,
-                  confidence
+                  confidence,
+                  freshness
+                FROM observations
+                WHERE id = 'observation-project-storage'
+                ",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("strengthened observation should be queryable");
+        assert_eq!(observation_count, 1);
+        assert_eq!(strengthened_proof_count, 2);
+        assert_eq!(strengthened_confidence, 0.95);
+        assert_eq!(strengthened_freshness, "strengthening");
+
+        insert_evidence(&conn, "evidence-observation-3", now);
+        let tx = conn
+            .transaction()
+            .expect("contradiction transaction should start");
+        upsert_observation_for_memory(
+            &tx,
+            "memory-observation",
+            "project.storage",
+            "decision",
+            &json!({"decision":"The frontend component stack is React."}),
+            &[
+                "evidence-observation".to_string(),
+                "evidence-observation-2".to_string(),
+                "evidence-observation-3".to_string(),
+            ],
+            None,
+            Some("stable"),
+            0.8,
+            now,
+        )
+        .expect("observation contradiction should compile");
+        tx.commit()
+            .expect("contradiction transaction should commit");
+
+        let (contradiction_count, weakening_freshness, weakened_confidence): (i64, String, f32) =
+            conn.query_row(
+                "
+                SELECT contradiction_count, freshness, confidence
                 FROM observations
                 WHERE id = 'observation-project-storage'
                 ",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .expect("strengthened observation should be queryable");
-        assert_eq!(observation_count, 1);
-        assert_eq!(strengthened_proof_count, 2);
-        assert_eq!(strengthened_confidence, 0.95);
+            .expect("contradicted observation should be queryable");
+        assert_eq!(contradiction_count, 1);
+        assert_eq!(weakening_freshness, "weakening");
+        assert_eq!(weakened_confidence, 0.8);
     }
 
     #[test]

@@ -61,6 +61,7 @@ Behavior:
 - Upserts retrieval metadata with proposal confidence, scope, and freshness.
 - Re-indexes the active memory into `retrieval_documents_fts` for retrieval v2.
 - Compiles or updates a canonical `observations` row with memory links, merged evidence links, and an observation FTS document.
+- Classifies observation updates as strengthening, weakening, or contradicted based on prior statement similarity, proof count, confidence, and freshness.
 - Marks proposal as `committed`.
 
 Response `200`:

@@ -47,6 +47,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - committed memories compile/update linked `observations` rows with memory links, evidence links, and observation FTS documents
   - added `db/migrations/0007_observation_canonical_keys.sql` for canonical observation identity
   - canonical observations now merge evidence across repeated commits to strengthen proof count
+  - observation updates now classify semantic state as strengthening, weakening, or contradicted using statement similarity, proof count, confidence, and freshness
 - Extended retrieval v2 scoring:
   - loads local SQLite FTS scores from `retrieval_documents_fts`
   - can retrieve concise memory answers through richer indexed documents
@@ -250,7 +251,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 - [~] Governance primitives implemented (forget + retention job APIs complete; governance UI pending)
 - [~] Smart memory foundation implemented (graph schema, versioned relationship compiler, graph retrieval, traversal controls, confidence-aware filters, ranking heuristics, canonicalization rules, and compaction complete; broader reasoning and graph semantics still pending)
 - [~] Verifiable privacy implemented (audit write/read APIs and MCP access complete; governance dashboard UI pending)
-- [~] Retrieval v2 foundation implemented (answer contract, repo/workspace scope schema, canonical observations schema/compiler, trace persistence, abstention behavior, benchmark seeds/loader/runner, local FTS indexing, FTS-aware rank fusion, stale/superseded handling, and 11/11 developer-memory benchmark pass complete; richer observation semantics still pending)
+- [~] Retrieval v2 foundation implemented (answer contract, repo/workspace scope schema, canonical observations schema/compiler, observation strengthening/weakening/contradiction semantics, trace persistence, abstention behavior, benchmark seeds/loader/runner, local FTS indexing, FTS-aware rank fusion, stale/superseded handling, and 11/11 developer-memory benchmark pass complete; richer observation ontology still pending)
 - [ ] Governance UI v1 implemented
 - [ ] MVP released
 
