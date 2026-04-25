@@ -293,6 +293,8 @@ Response `200`:
 
 Hard-removes a memory item and its versions. By default, unreferenced linked evidence records are deleted too.
 
+For imported memories, forget also detaches retrieval metadata, compiled observations, observation events, and import job item references before deleting the memory/evidence rows. If `forget_evidence` is true and the evidence is no longer used by memory, observation, or graph links, import job item rows pointing at that evidence are removed so hard deletion can complete.
+
 Request:
 
 ```json

@@ -4344,6 +4344,7 @@ fn delete_memory_item_by_id_tx(
 ) -> Result<DeleteCounts, ApiError> {
     let version_ids = load_version_ids_for_item(conn, memory_item_id)?;
     let linked_evidence_ids = load_evidence_ids_for_versions(conn, &version_ids)?;
+    detach_memory_from_retrieval_state(conn, memory_item_id)?;
 
     let deleted_links = conn
         .execute(
@@ -4378,23 +4379,14 @@ fn delete_memory_item_by_id_tx(
     let mut deleted_evidence = 0usize;
     if forget_evidence {
         for evidence_id in linked_evidence_ids {
-            let still_linked: Option<String> = conn
-                .query_row(
-                    "
-                    SELECT evidence_record_id
-                    FROM memory_links
-                    WHERE evidence_record_id = ?1
-                    LIMIT 1
-                    ",
+            if !evidence_has_active_references(conn, &evidence_id)? {
+                conn.execute(
+                    "DELETE FROM import_job_items WHERE evidence_record_id = ?1",
                     params![&evidence_id],
-                    |r| r.get(0),
                 )
-                .optional()
                 .map_err(|e| {
-                    ApiError::internal(format!("failed evidence linkage lookup: {}", e))
+                    ApiError::internal(format!("failed to delete import evidence refs: {}", e))
                 })?;
-
-            if still_linked.is_none() {
                 deleted_evidence += conn
                     .execute(
                         "DELETE FROM evidence_records WHERE id = ?1",
@@ -4412,6 +4404,127 @@ fn delete_memory_item_by_id_tx(
         deleted_links,
         deleted_evidence,
     })
+}
+
+fn detach_memory_from_retrieval_state(
+    conn: &Connection,
+    memory_item_id: &str,
+) -> Result<(), ApiError> {
+    let observation_ids = load_observation_ids_for_memory(conn, memory_item_id)?;
+
+    conn.execute(
+        "DELETE FROM retrieval_documents_fts WHERE source_type = 'memory_item' AND source_id = ?1",
+        params![memory_item_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to delete memory FTS document: {}", e)))?;
+    conn.execute(
+        "DELETE FROM memory_item_metadata WHERE memory_item_id = ?1",
+        params![memory_item_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to delete memory metadata: {}", e)))?;
+    conn.execute(
+        "UPDATE import_job_items SET memory_item_id = NULL WHERE memory_item_id = ?1",
+        params![memory_item_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to detach import job memory refs: {}", e)))?;
+    conn.execute(
+        "UPDATE observation_events SET memory_item_id = NULL WHERE memory_item_id = ?1",
+        params![memory_item_id],
+    )
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "failed to detach observation event memory refs: {}",
+            e
+        ))
+    })?;
+    conn.execute(
+        "DELETE FROM observation_memory_links WHERE memory_item_id = ?1",
+        params![memory_item_id],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to delete observation memory links: {}", e)))?;
+
+    for observation_id in observation_ids {
+        let remaining_links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observation_memory_links WHERE observation_id = ?1",
+                params![&observation_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to count observation memory links: {}", e))
+            })?;
+        if remaining_links == 0 {
+            conn.execute(
+                "DELETE FROM retrieval_documents_fts WHERE source_type = 'observation' AND source_id = ?1",
+                params![&observation_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to delete observation FTS document: {}", e))
+            })?;
+            conn.execute(
+                "DELETE FROM observation_events WHERE observation_id = ?1",
+                params![&observation_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to delete observation events: {}", e))
+            })?;
+            conn.execute(
+                "DELETE FROM observation_evidence_links WHERE observation_id = ?1",
+                params![&observation_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "failed to delete observation evidence links: {}",
+                    e
+                ))
+            })?;
+            conn.execute(
+                "DELETE FROM observations WHERE id = ?1",
+                params![&observation_id],
+            )
+            .map_err(|e| ApiError::internal(format!("failed to delete observation: {}", e)))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_observation_ids_for_memory(
+    conn: &Connection,
+    memory_item_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT observation_id
+            FROM observation_memory_links
+            WHERE memory_item_id = ?1
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to prepare observation id lookup: {}", e))
+        })?;
+    let rows = stmt
+        .query_map(params![memory_item_id], |row| row.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to query observation ids: {}", e)))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read observation ids: {}", e)))
+}
+
+fn evidence_has_active_references(conn: &Connection, evidence_id: &str) -> Result<bool, ApiError> {
+    let refs: i64 = conn
+        .query_row(
+            "
+            SELECT
+              (SELECT COUNT(*) FROM memory_links WHERE evidence_record_id = ?1) +
+              (SELECT COUNT(*) FROM observation_evidence_links WHERE evidence_record_id = ?1) +
+              (SELECT COUNT(*) FROM graph_relationship_evidence_links WHERE evidence_record_id = ?1)
+            ",
+            params![evidence_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ApiError::internal(format!("failed evidence reference lookup: {}", e)))?;
+    Ok(refs > 0)
 }
 
 fn apply_retention_policy(
@@ -4655,10 +4768,10 @@ mod tests {
 
     use super::{
         apply_graph_confidence_migration, apply_observation_canonical_key_migration,
-        compact_graph_relationships, ensure_graph_entity, ensure_graph_entity_without_alias,
-        import_markdown_content, load_import_job, parse_markdown_memory_items,
-        upsert_observation_for_memory, CreateProposalRequest, GraphEntityRef,
-        ImportMarkdownRequest,
+        compact_graph_relationships, delete_memory_item_by_id_tx, ensure_graph_entity,
+        ensure_graph_entity_without_alias, import_markdown_content, load_import_job,
+        parse_markdown_memory_items, upsert_observation_for_memory, CreateProposalRequest,
+        GraphEntityRef, ImportMarkdownRequest,
     };
 
     #[test]
@@ -4781,6 +4894,26 @@ Prefer Rust for CLI tools.
             })
             .expect("version count should be queryable");
         assert_eq!(version_count, 1);
+
+        let deleted = delete_memory_item_by_id_tx(&conn, &response.memory_item_ids[0], true)
+            .expect("imported memory should remain forgettable");
+        assert_eq!(deleted.deleted_evidence, 1);
+        let remaining_memory_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_items", [], |row| row.get(0))
+            .expect("remaining memory count should be queryable");
+        assert_eq!(remaining_memory_count, 0);
+        let remaining_evidence_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM evidence_records", [], |row| {
+                row.get(0)
+            })
+            .expect("remaining evidence count should be queryable");
+        assert_eq!(remaining_evidence_count, 0);
+        let remaining_import_item_refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM import_job_items", [], |row| {
+                row.get(0)
+            })
+            .expect("remaining import item count should be queryable");
+        assert_eq!(remaining_import_item_refs, 0);
     }
 
     #[test]
