@@ -97,6 +97,44 @@ Response `200`:
 }
 ```
 
+## POST /v1/import/sources/forget
+
+Revokes memories imported from a specific source, such as `AGENTS.md` or `CLAUDE.md`.
+
+This is the source-level governance primitive for portability imports. It deletes committed memory items created from that source, detaches retrieval metadata and compiled observations, deletes pending import proposals from the same source, and optionally deletes now-unreferenced evidence records.
+
+Request:
+
+```json
+{
+  "source_ref": "AGENTS.md",
+  "source_type": "local_markdown_memory",
+  "forget_evidence": true
+}
+```
+
+Notes:
+
+- `source_ref` is required and matches the imported source path/name.
+- `source_type` is optional. If omitted, all import source types with the given `source_ref` are matched.
+- `forget_evidence` defaults to `true`.
+- Import job header rows remain as historical operation reports. Item rows are removed when their evidence is hard-deleted.
+
+Response `200`:
+
+```json
+{
+  "source_ref": "AGENTS.md",
+  "source_type": "local_markdown_memory",
+  "matched_memory_items": 2,
+  "deleted_memory_items": 2,
+  "deleted_versions": 2,
+  "deleted_links": 2,
+  "deleted_proposals": 3,
+  "deleted_evidence": 3
+}
+```
+
 ## POST /v1/proposals
 
 Create a pending `MemoryProposal`.

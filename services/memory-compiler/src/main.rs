@@ -161,6 +161,26 @@ struct ImportJobItemResponse {
     created_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ForgetImportSourceRequest {
+    source_ref: String,
+    source_type: Option<String>,
+    #[serde(default = "default_true")]
+    forget_evidence: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ForgetImportSourceResponse {
+    source_ref: String,
+    source_type: Option<String>,
+    matched_memory_items: usize,
+    deleted_memory_items: usize,
+    deleted_versions: usize,
+    deleted_links: usize,
+    deleted_proposals: usize,
+    deleted_evidence: usize,
+}
+
 type ImportJobRow = (
     String,
     String,
@@ -650,6 +670,13 @@ struct GraphCompactionCounts {
 struct DeleteCounts {
     deleted_versions: usize,
     deleted_links: usize,
+    deleted_proposals: usize,
+    deleted_evidence: usize,
+}
+
+#[derive(Debug, Default)]
+struct PendingImportDeleteCounts {
+    deleted_proposals: usize,
     deleted_evidence: usize,
 }
 
@@ -741,6 +768,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/v1/import/markdown", post(import_markdown))
         .route("/v1/import/jobs/{id}", get(get_import_job))
+        .route("/v1/import/sources/forget", post(forget_import_source))
         .route("/v1/proposals", post(create_proposal))
         .route("/v1/proposals/{id}/commit", post(commit_proposal))
         .route("/v1/proposals/{id}/reject", post(reject_proposal))
@@ -819,6 +847,69 @@ async fn get_import_job(
 ) -> Result<Json<ImportJobResponse>, ApiError> {
     let conn = open_db(&state.db_path)?;
     Ok(Json(load_import_job(&conn, &id)?))
+}
+
+async fn forget_import_source(
+    State(state): State<AppState>,
+    Json(payload): Json<ForgetImportSourceRequest>,
+) -> Result<Json<ForgetImportSourceResponse>, ApiError> {
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn.transaction().map_err(|e| {
+        ApiError::internal(format!("failed to start import source forget tx: {}", e))
+    })?;
+    let response = forget_import_source_tx(&tx, payload)?;
+    tx.commit().map_err(|e| {
+        ApiError::internal(format!("failed to commit import source forget tx: {}", e))
+    })?;
+
+    Ok(Json(response))
+}
+
+fn forget_import_source_tx(
+    conn: &Connection,
+    payload: ForgetImportSourceRequest,
+) -> Result<ForgetImportSourceResponse, ApiError> {
+    let source_ref = payload.source_ref.trim().to_string();
+    if source_ref.is_empty() {
+        return Err(ApiError::bad_request("source_ref is required"));
+    }
+    if source_ref.len() > 512 {
+        return Err(ApiError::bad_request("source_ref exceeds 512 chars"));
+    }
+
+    let source_type = trim_optional(payload.source_type);
+    if source_type.as_ref().is_some_and(|value| value.len() > 128) {
+        return Err(ApiError::bad_request("source_type exceeds 128 chars"));
+    }
+    let memory_item_ids = load_import_source_memory_ids(conn, &source_ref, source_type.as_deref())?;
+    let mut counts = DeleteCounts::default();
+    let mut deleted_memory_items = 0usize;
+    for memory_item_id in &memory_item_ids {
+        let item_counts =
+            delete_memory_item_by_id_tx(conn, memory_item_id, payload.forget_evidence)?;
+        counts.deleted_versions += item_counts.deleted_versions;
+        counts.deleted_links += item_counts.deleted_links;
+        counts.deleted_proposals += item_counts.deleted_proposals;
+        counts.deleted_evidence += item_counts.deleted_evidence;
+        deleted_memory_items += 1;
+    }
+    let pending_counts = delete_import_source_pending_proposals(
+        conn,
+        &source_ref,
+        source_type.as_deref(),
+        payload.forget_evidence,
+    )?;
+
+    Ok(ForgetImportSourceResponse {
+        source_ref,
+        source_type,
+        matched_memory_items: memory_item_ids.len(),
+        deleted_memory_items,
+        deleted_versions: counts.deleted_versions,
+        deleted_links: counts.deleted_links,
+        deleted_proposals: counts.deleted_proposals + pending_counts.deleted_proposals,
+        deleted_evidence: counts.deleted_evidence + pending_counts.deleted_evidence,
+    })
 }
 
 async fn create_proposal(
@@ -4376,10 +4467,13 @@ fn delete_memory_item_by_id_tx(
         return Err(ApiError::not_found("memory item not found"));
     }
 
+    let mut deleted_proposals = 0usize;
     let mut deleted_evidence = 0usize;
     if forget_evidence {
         for evidence_id in linked_evidence_ids {
             if !evidence_has_active_references(conn, &evidence_id)? {
+                let import_proposal_ids =
+                    load_import_proposal_ids_for_evidence(conn, &evidence_id)?;
                 conn.execute(
                     "DELETE FROM import_job_items WHERE evidence_record_id = ?1",
                     params![&evidence_id],
@@ -4387,6 +4481,7 @@ fn delete_memory_item_by_id_tx(
                 .map_err(|e| {
                     ApiError::internal(format!("failed to delete import evidence refs: {}", e))
                 })?;
+                deleted_proposals += delete_import_proposals_by_id(conn, &import_proposal_ids)?;
                 deleted_evidence += conn
                     .execute(
                         "DELETE FROM evidence_records WHERE id = ?1",
@@ -4402,6 +4497,7 @@ fn delete_memory_item_by_id_tx(
     Ok(DeleteCounts {
         deleted_versions,
         deleted_links,
+        deleted_proposals,
         deleted_evidence,
     })
 }
@@ -4525,6 +4621,164 @@ fn evidence_has_active_references(conn: &Connection, evidence_id: &str) -> Resul
         )
         .map_err(|e| ApiError::internal(format!("failed evidence reference lookup: {}", e)))?;
     Ok(refs > 0)
+}
+
+fn load_import_source_memory_ids(
+    conn: &Connection,
+    source_ref: &str,
+    source_type: Option<&str>,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT DISTINCT iji.memory_item_id
+            FROM import_job_items iji
+            JOIN import_jobs ij ON ij.id = iji.import_job_id
+            WHERE iji.source_ref = ?1
+              AND (?2 IS NULL OR ij.source_type = ?2)
+              AND iji.memory_item_id IS NOT NULL
+            ORDER BY iji.memory_item_id
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to prepare import source memory lookup: {}",
+                e
+            ))
+        })?;
+    let rows = stmt
+        .query_map(params![source_ref, source_type], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| {
+            ApiError::internal(format!("failed to query import source memories: {}", e))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read import source memories: {}", e)))
+}
+
+fn delete_import_source_pending_proposals(
+    conn: &Connection,
+    source_ref: &str,
+    source_type: Option<&str>,
+    forget_evidence: bool,
+) -> Result<PendingImportDeleteCounts, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT iji.id, iji.proposal_id, iji.evidence_record_id
+            FROM import_job_items iji
+            JOIN import_jobs ij ON ij.id = iji.import_job_id
+            WHERE iji.source_ref = ?1
+              AND (?2 IS NULL OR ij.source_type = ?2)
+              AND iji.memory_item_id IS NULL
+              AND iji.proposal_id IS NOT NULL
+            ORDER BY iji.id
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to prepare pending import proposal lookup: {}",
+                e
+            ))
+        })?;
+    let rows = stmt
+        .query_map(params![source_ref, source_type], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| {
+            ApiError::internal(format!("failed to query pending import proposals: {}", e))
+        })?;
+    let pending = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read pending imports: {}", e)))?;
+
+    let mut counts = PendingImportDeleteCounts::default();
+    for (item_id, proposal_id, evidence_id) in pending {
+        if forget_evidence {
+            conn.execute(
+                "DELETE FROM import_job_items WHERE id = ?1",
+                params![&item_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to delete pending import item: {}", e))
+            })?;
+        } else {
+            conn.execute(
+                "
+                UPDATE import_job_items
+                SET status = 'source_forgotten', proposal_id = NULL
+                WHERE id = ?1
+                ",
+                params![&item_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to detach pending import item: {}", e))
+            })?;
+        }
+        counts.deleted_proposals += conn
+            .execute(
+                "DELETE FROM memory_proposals WHERE id = ?1",
+                params![&proposal_id],
+            )
+            .map_err(|e| {
+                ApiError::internal(format!("failed to delete pending import proposal: {}", e))
+            })?;
+        if forget_evidence && !evidence_has_active_references(conn, &evidence_id)? {
+            counts.deleted_evidence += conn
+                .execute(
+                    "DELETE FROM evidence_records WHERE id = ?1",
+                    params![&evidence_id],
+                )
+                .map_err(|e| {
+                    ApiError::internal(format!("failed to delete pending import evidence: {}", e))
+                })?;
+        }
+    }
+    Ok(counts)
+}
+
+fn load_import_proposal_ids_for_evidence(
+    conn: &Connection,
+    evidence_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT DISTINCT proposal_id
+            FROM import_job_items
+            WHERE evidence_record_id = ?1
+              AND proposal_id IS NOT NULL
+            ",
+        )
+        .map_err(|e| {
+            ApiError::internal(format!("failed to prepare import proposal lookup: {}", e))
+        })?;
+    let rows = stmt
+        .query_map(params![evidence_id], |row| row.get::<_, String>(0))
+        .map_err(|e| ApiError::internal(format!("failed to query import proposals: {}", e)))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read import proposals: {}", e)))
+}
+
+fn delete_import_proposals_by_id(
+    conn: &Connection,
+    proposal_ids: &[String],
+) -> Result<usize, ApiError> {
+    let mut deleted = 0usize;
+    for proposal_id in proposal_ids {
+        deleted += conn
+            .execute(
+                "DELETE FROM memory_proposals WHERE id = ?1",
+                params![proposal_id],
+            )
+            .map_err(|e| ApiError::internal(format!("failed to delete import proposal: {}", e)))?;
+    }
+    Ok(deleted)
 }
 
 fn apply_retention_policy(
@@ -4769,9 +5023,9 @@ mod tests {
     use super::{
         apply_graph_confidence_migration, apply_observation_canonical_key_migration,
         compact_graph_relationships, delete_memory_item_by_id_tx, ensure_graph_entity,
-        ensure_graph_entity_without_alias, import_markdown_content, load_import_job,
-        parse_markdown_memory_items, upsert_observation_for_memory, CreateProposalRequest,
-        GraphEntityRef, ImportMarkdownRequest,
+        ensure_graph_entity_without_alias, forget_import_source_tx, import_markdown_content,
+        load_import_job, parse_markdown_memory_items, upsert_observation_for_memory,
+        CreateProposalRequest, ForgetImportSourceRequest, GraphEntityRef, ImportMarkdownRequest,
     };
 
     #[test]
@@ -4914,6 +5168,90 @@ Prefer Rust for CLI tools.
             })
             .expect("remaining import item count should be queryable");
         assert_eq!(remaining_import_item_refs, 0);
+    }
+
+    #[test]
+    fn markdown_import_source_forget_deletes_committed_and_pending_imports() {
+        let mut conn = test_conn();
+        let imported_at = "2026-04-24T12:00:00+00:00";
+        let committed_request = ImportMarkdownRequest {
+            source_ref: "AGENTS.md".to_string(),
+            content:
+                "# Decisions\n\n- Use SQLite for local-first storage.\n- Prefer Rust services."
+                    .to_string(),
+            source_type: None,
+            scope: None,
+            commit: Some(true),
+            confidence: Some(0.82),
+        };
+        let pending_request = ImportMarkdownRequest {
+            source_ref: "AGENTS.md".to_string(),
+            content: "# Preferences\n\n- Keep agent memory local-first.".to_string(),
+            source_type: None,
+            scope: None,
+            commit: Some(false),
+            confidence: Some(0.72),
+        };
+
+        let tx = conn
+            .transaction()
+            .expect("committed import transaction should start");
+        let committed =
+            import_markdown_content(&tx, &committed_request, imported_at).expect("import works");
+        tx.commit()
+            .expect("committed import transaction should commit");
+        assert_eq!(committed.committed_items, 2);
+
+        let tx = conn
+            .transaction()
+            .expect("pending import transaction should start");
+        let pending = import_markdown_content(&tx, &pending_request, imported_at)
+            .expect("pending import works");
+        tx.commit()
+            .expect("pending import transaction should commit");
+        assert_eq!(pending.committed_items, 0);
+        assert_eq!(pending.proposal_ids.len(), 1);
+
+        let response = forget_import_source_tx(
+            &conn,
+            ForgetImportSourceRequest {
+                source_ref: " AGENTS.md ".to_string(),
+                source_type: Some("local_markdown_memory".to_string()),
+                forget_evidence: true,
+            },
+        )
+        .expect("source forget should work");
+
+        assert_eq!(response.source_ref, "AGENTS.md");
+        assert_eq!(response.matched_memory_items, 2);
+        assert_eq!(response.deleted_memory_items, 2);
+        assert_eq!(response.deleted_proposals, 3);
+        assert_eq!(response.deleted_evidence, 3);
+
+        for table in [
+            "memory_items",
+            "memory_item_versions",
+            "memory_links",
+            "memory_proposals",
+            "evidence_records",
+            "observations",
+            "observation_events",
+            "observation_memory_links",
+            "observation_evidence_links",
+            "import_job_items",
+            "retrieval_documents_fts",
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {}", table);
+            let count: i64 = conn
+                .query_row(&query, [], |row| row.get(0))
+                .expect("table count should be queryable");
+            assert_eq!(count, 0, "{} should be empty after source forget", table);
+        }
+
+        let import_job_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0))
+            .expect("import job count should be queryable");
+        assert_eq!(import_job_count, 2);
     }
 
     #[test]

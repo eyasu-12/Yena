@@ -46,6 +46,8 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - repeated unchanged Markdown imports skip duplicate commits instead of creating noisy memory versions
   - added `db/migrations/0009_import_jobs.sql` plus `GET /v1/import/jobs/{id}` for durable import reports and per-item committed/skipped/pending status
   - updated hard-forget cleanup so imported memories detach retrieval metadata, observations, observation events, and import job item references before deleting memory/evidence rows
+  - added `POST /v1/import/sources/forget` to revoke all committed memories and pending proposals imported from a specific source such as `AGENTS.md` or `CLAUDE.md`
+  - verified import source revocation clears imported memories, import proposals, evidence, import job item refs, observations, and retrieval FTS while preserving import job headers
   - `POST /v1/proposals` accepts optional scope and freshness metadata
   - committed memories upsert `memory_item_metadata`
   - committed memories and graph relationships upsert local `retrieval_documents_fts` documents
