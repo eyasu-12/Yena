@@ -12,6 +12,54 @@ Response:
 }
 ```
 
+## POST /v1/import/markdown
+
+Imports existing Markdown memory files, such as `AGENTS.md`, `CLAUDE.md`, or `memory.md`, into Yena's evidence-backed memory pipeline.
+
+The service does not read arbitrary local files directly. Callers pass file content in the request body, keeping filesystem access outside the compiler boundary.
+
+Request:
+
+```json
+{
+  "source_ref": "AGENTS.md",
+  "source_type": "local_markdown_memory",
+  "content": "# Decisions\n\n- Use SQLite for local-first storage.",
+  "commit": true,
+  "confidence": 0.74,
+  "scope": {
+    "kind": "repo",
+    "repo_path": "/Users/eyasu/Projects/Yena",
+    "repo_remote": "https://github.com/eyasu-12/Yena.git",
+    "branch": "main"
+  }
+}
+```
+
+Behavior:
+
+- Parses headings, bullets, numbered items, and plain paragraphs outside fenced code blocks.
+- Creates one immutable evidence record per imported memory item.
+- Creates a `markdown_import` memory proposal for each item.
+- If `commit` is omitted or `true`, commits each proposal into active memory, compiled observations, and retrieval FTS.
+- If `commit` is `false`, leaves proposals pending for later review.
+- Uses deterministic subject keys derived from source, section, and item checksum so repeated imports map to the same canonical memory identity.
+- Skips unchanged already-committed items instead of creating duplicate memory versions.
+
+Response `200`:
+
+```json
+{
+  "source_ref": "AGENTS.md",
+  "imported_items": 2,
+  "committed_items": 2,
+  "skipped_items": 0,
+  "evidence_record_ids": ["uuid"],
+  "proposal_ids": ["uuid"],
+  "memory_item_ids": ["uuid"]
+}
+```
+
 ## POST /v1/proposals
 
 Create a pending `MemoryProposal`.

@@ -2,16 +2,22 @@
 
 ## Core Memory Engine
 
-### Import `AGENTS.md` / `CLAUDE.md` After Retrieval V2
+### Expand Markdown Import Into Product Workflow
 
-**What:** Add a local import path that turns existing developer memory files into Yena evidence, memory proposals, observations, and benchmark cases.
+**What:** Build on the backend Markdown import endpoint with a product workflow that turns existing developer memory files into Yena evidence, memory proposals, observations, benchmark cases, and user-visible import reports.
 
 **Why:** The first customer already maintains repo memory files. Yena should make adoption easy by ingesting the status quo instead of asking users to manually re-enter context.
 
-**Context:** This should wait until retrieval v2 works well enough to show clear value. The intended product moment is `yena import AGENTS.md`, then asking Yena a project-memory question and receiving an answer with evidence and trace. Keep the first version narrow: local Markdown files only, no broad connector framework, no dashboard requirement.
+**Context:** The backend compiler endpoint now exists: `POST /v1/import/markdown`. The next layer should add a narrow caller flow around it, then connect imported items to retrieval benchmark cases and later UI/audit visibility. Keep the first version narrow: local Markdown files only, no broad connector framework, no dashboard requirement.
 
 **Effort:** M
 **Priority:** P2
-**Depends on:** Retrieval v2 working with developer ontology, observations, policy-filtered retrieval traces, and the developer-memory benchmark.
+**Depends on:** Backend Markdown import endpoint, retrieval v2, observations, policy-filtered retrieval traces, and the developer-memory benchmark.
 
 ## Completed
+
+### Backend Markdown Import Foundation
+
+**Completed:** `POST /v1/import/markdown` in `memory-compiler`.
+
+**What it does:** Parses Markdown content passed by the caller, creates one immutable evidence record per imported item, creates `markdown_import` proposals, optionally commits them directly into memory items, compiled observations, observation events, and retrieval FTS. Repeated unchanged imports skip duplicate commits.

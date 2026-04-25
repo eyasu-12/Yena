@@ -16,6 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tracing::info;
 use uuid::Uuid;
 
@@ -107,6 +108,41 @@ struct RejectProposalResponse {
     proposal_id: String,
     status: String,
     resolved_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ImportMarkdownRequest {
+    source_ref: String,
+    content: String,
+    source_type: Option<String>,
+    scope: Option<MemoryScopePayload>,
+    commit: Option<bool>,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportMarkdownResponse {
+    source_ref: String,
+    imported_items: usize,
+    committed_items: usize,
+    skipped_items: usize,
+    evidence_record_ids: Vec<String>,
+    proposal_ids: Vec<String>,
+    memory_item_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMarkdownMemory {
+    section_path: String,
+    statement: String,
+    memory_type: String,
+}
+
+#[derive(Debug)]
+struct CommittedMemoryIds {
+    memory_item_id: String,
+    version_id: String,
+    superseded_version_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +697,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { db_path };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/import/markdown", post(import_markdown))
         .route("/v1/proposals", post(create_proposal))
         .route("/v1/proposals/{id}/commit", post(commit_proposal))
         .route("/v1/proposals/{id}/reject", post(reject_proposal))
@@ -715,6 +752,24 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+async fn import_markdown(
+    State(state): State<AppState>,
+    Json(payload): Json<ImportMarkdownRequest>,
+) -> Result<Json<ImportMarkdownResponse>, ApiError> {
+    validate_import_markdown_request(&payload)?;
+
+    let mut conn = open_db(&state.db_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::internal(format!("failed to start import tx: {}", e)))?;
+    let imported_at = Utc::now().to_rfc3339();
+    let response = import_markdown_content(&tx, &payload, &imported_at)?;
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit markdown import: {}", e)))?;
+
+    Ok(Json(response))
+}
+
 async fn create_proposal(
     State(state): State<AppState>,
     Json(payload): Json<CreateProposalRequest>,
@@ -762,6 +817,364 @@ async fn create_proposal(
     ))
 }
 
+fn validate_import_markdown_request(payload: &ImportMarkdownRequest) -> Result<(), ApiError> {
+    if payload.source_ref.trim().is_empty() {
+        return Err(ApiError::bad_request("source_ref is required"));
+    }
+    if payload.content.trim().is_empty() {
+        return Err(ApiError::bad_request("content is required"));
+    }
+    if payload.source_ref.len() > 512 {
+        return Err(ApiError::bad_request("source_ref exceeds 512 chars"));
+    }
+    if let Some(source_type) = &payload.source_type {
+        if source_type.len() > 128 {
+            return Err(ApiError::bad_request("source_type exceeds 128 chars"));
+        }
+    }
+    if let Some(confidence) = payload.confidence {
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(ApiError::bad_request(
+                "confidence must be between 0.0 and 1.0",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn import_markdown_content(
+    tx: &Transaction<'_>,
+    payload: &ImportMarkdownRequest,
+    imported_at: &str,
+) -> Result<ImportMarkdownResponse, ApiError> {
+    let parsed_items = parse_markdown_memory_items(&payload.content);
+    if parsed_items.is_empty() {
+        return Err(ApiError::bad_request(
+            "content did not contain importable markdown memory items",
+        ));
+    }
+
+    let source_type = payload
+        .source_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local_markdown_memory");
+    let should_commit = payload.commit.unwrap_or(true);
+    let confidence = payload.confidence.unwrap_or(0.74);
+    let mut evidence_record_ids = Vec::new();
+    let mut proposal_ids = Vec::new();
+    let mut memory_item_ids = Vec::new();
+    let mut skipped_items = 0usize;
+    let source_slug = stable_key_fragment(&payload.source_ref);
+
+    for item in parsed_items {
+        let item_checksum = checksum_hex(item.statement.as_bytes());
+        let item_ref = format!(
+            "{}#{}:{}",
+            payload.source_ref,
+            stable_key_fragment(&item.section_path),
+            &item_checksum[..12]
+        );
+        let evidence_id = upsert_import_evidence(
+            tx,
+            source_type,
+            &item_ref,
+            "text/markdown",
+            &item.statement,
+            imported_at,
+        )?;
+        let subject_key = format!(
+            "import.markdown.{}.{}.{}",
+            source_slug,
+            stable_key_fragment(&item.section_path),
+            &item_checksum[..12]
+        );
+        let value_json = json!({
+            "statement": item.statement,
+            "source_ref": payload.source_ref,
+            "section": item.section_path,
+            "import_kind": "markdown_memory"
+        });
+        let evidence_ids = vec![evidence_id.clone()];
+        evidence_record_ids.push(evidence_id.clone());
+
+        if should_commit
+            && active_memory_matches_import(tx, &subject_key, &value_json, &evidence_ids)?
+        {
+            skipped_items += 1;
+            continue;
+        }
+
+        let proposal_id = insert_import_proposal(
+            tx,
+            &subject_key,
+            &item.memory_type,
+            &value_json,
+            &evidence_ids,
+            payload.scope.as_ref(),
+            confidence,
+            should_commit,
+            imported_at,
+        )?;
+        if should_commit {
+            let committed = commit_memory_item(
+                tx,
+                &item.memory_type,
+                &subject_key,
+                &value_json,
+                &evidence_ids,
+                payload.scope.as_ref(),
+                Some("stable"),
+                confidence,
+                imported_at,
+            )?;
+            memory_item_ids.push(committed.memory_item_id);
+        }
+        proposal_ids.push(proposal_id);
+    }
+
+    Ok(ImportMarkdownResponse {
+        source_ref: payload.source_ref.clone(),
+        imported_items: evidence_record_ids.len(),
+        committed_items: memory_item_ids.len(),
+        skipped_items,
+        evidence_record_ids,
+        proposal_ids,
+        memory_item_ids,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_import_proposal(
+    tx: &Transaction<'_>,
+    subject_key: &str,
+    memory_type: &str,
+    value_json: &Value,
+    evidence_record_ids: &[String],
+    scope: Option<&MemoryScopePayload>,
+    confidence: f32,
+    committed: bool,
+    created_at: &str,
+) -> Result<String, ApiError> {
+    let proposal_id = Uuid::new_v4().to_string();
+    let payload = ProposalPayload {
+        memory_type: memory_type.to_string(),
+        value_json: value_json.clone(),
+        evidence_record_ids: evidence_record_ids.to_vec(),
+        scope: scope.cloned(),
+        freshness: Some("stable".to_string()),
+    };
+    let status = if committed { "committed" } else { "pending" };
+    let resolved_at = if committed { Some(created_at) } else { None };
+    tx.execute(
+        "
+        INSERT INTO memory_proposals (
+          id, proposal_type, subject_key, payload_json, confidence, status, created_at, resolved_at
+        ) VALUES (?1, 'markdown_import', ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+        params![
+            proposal_id,
+            subject_key,
+            serde_json::to_string(&payload).map_err(|e| {
+                ApiError::internal(format!("failed to encode import proposal payload: {}", e))
+            })?,
+            confidence,
+            status,
+            created_at,
+            resolved_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert import proposal: {}", e)))?;
+    Ok(proposal_id)
+}
+
+fn upsert_import_evidence(
+    tx: &Transaction<'_>,
+    source_type: &str,
+    source_ref: &str,
+    content_type: &str,
+    content: &str,
+    imported_at: &str,
+) -> Result<String, ApiError> {
+    let checksum = checksum_hex(content.as_bytes());
+    if let Some(existing_id) = tx
+        .query_row(
+            "
+            SELECT id
+            FROM evidence_records
+            WHERE source_type = ?1
+              AND source_ref = ?2
+              AND checksum = ?3
+            LIMIT 1
+            ",
+            params![source_type, source_ref, &checksum],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup import evidence: {}", e)))?
+    {
+        return Ok(existing_id);
+    }
+
+    let evidence_id = Uuid::new_v4().to_string();
+    tx.execute(
+        "
+        INSERT INTO evidence_records (
+          id, source_type, source_ref, content_type, content, created_at, ingested_at, checksum
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
+        ",
+        params![
+            evidence_id,
+            source_type,
+            source_ref,
+            content_type,
+            content,
+            imported_at,
+            checksum,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert import evidence: {}", e)))?;
+    Ok(evidence_id)
+}
+
+fn active_memory_matches_import(
+    tx: &Transaction<'_>,
+    subject_key: &str,
+    value_json: &Value,
+    evidence_record_ids: &[String],
+) -> Result<bool, ApiError> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "
+            SELECT mi.active_version_id, mv.value_json
+            FROM memory_items mi
+            JOIN memory_item_versions mv ON mv.id = mi.active_version_id
+            WHERE mi.canonical_key = ?1
+              AND mi.status = 'active'
+            LIMIT 1
+            ",
+            params![subject_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup imported memory: {}", e)))?;
+
+    let Some((active_version_id, active_value_raw)) = row else {
+        return Ok(false);
+    };
+    let active_value: Value = serde_json::from_str(&active_value_raw).map_err(|e| {
+        ApiError::internal(format!("failed to decode imported active value: {}", e))
+    })?;
+    if active_value != *value_json {
+        return Ok(false);
+    }
+
+    let active_evidence = load_evidence_for_version(tx, &active_version_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let requested_evidence = evidence_record_ids.iter().cloned().collect::<BTreeSet<_>>();
+    Ok(active_evidence == requested_evidence)
+}
+
+fn parse_markdown_memory_items(content: &str) -> Vec<ParsedMarkdownMemory> {
+    let mut headings: Vec<(usize, String)> = Vec::new();
+    let mut in_code_fence = false;
+    let mut items = Vec::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence || line.is_empty() {
+            continue;
+        }
+        if let Some((level, title)) = parse_markdown_heading(line) {
+            headings.retain(|(existing_level, _)| *existing_level < level);
+            headings.push((level, clean_markdown_text(title)));
+            continue;
+        }
+
+        let Some(statement) = parse_markdown_statement(line) else {
+            continue;
+        };
+        let section_path = if headings.is_empty() {
+            "root".to_string()
+        } else {
+            headings
+                .iter()
+                .map(|(_, title)| title.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        let memory_type = infer_markdown_memory_type(&section_path, &statement);
+        items.push(ParsedMarkdownMemory {
+            section_path,
+            statement,
+            memory_type,
+        });
+    }
+
+    items
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let title = line[level..].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some((level, title))
+    }
+}
+
+fn parse_markdown_statement(line: &str) -> Option<String> {
+    let stripped = strip_markdown_list_marker(line).unwrap_or(line).trim();
+    let cleaned = clean_markdown_text(stripped);
+    if cleaned.len() < 8 {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn strip_markdown_list_marker(line: &str) -> Option<&str> {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return Some(rest);
+        }
+    }
+    let (number, rest) = line.split_once(". ")?;
+    if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn clean_markdown_text(value: &str) -> String {
+    value
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
+}
+
+fn infer_markdown_memory_type(section_path: &str, statement: &str) -> String {
+    let haystack = format!("{} {}", section_path, statement).to_lowercase();
+    if haystack.contains("prefer") || haystack.contains("preference") {
+        "preference".to_string()
+    } else {
+        "project".to_string()
+    }
+}
+
 async fn commit_proposal(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -787,19 +1200,60 @@ async fn commit_proposal(
     let payload: ProposalPayload = serde_json::from_str(&proposal.payload_json)
         .map_err(|e| ApiError::internal(format!("failed to decode payload_json: {}", e)))?;
 
-    for evidence_id in &payload.evidence_record_ids {
-        ensure_evidence_exists(&tx, evidence_id)?;
-    }
-
     let committed_at = Utc::now().to_rfc3339();
-    let (memory_item_id, old_active_version_id) = ensure_memory_item(
+    let committed = commit_memory_item(
         &tx,
         &payload.memory_type,
         &proposal.subject_key,
+        &payload.value_json,
+        &payload.evidence_record_ids,
+        payload.scope.as_ref(),
+        payload.freshness.as_deref(),
+        proposal.confidence,
         &committed_at,
     )?;
 
-    let version_number = next_version_number(&tx, &memory_item_id)?;
+    tx.execute(
+        "
+        UPDATE memory_proposals
+        SET status = 'committed', resolved_at = ?2
+        WHERE id = ?1
+        ",
+        params![proposal.id, committed_at],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to update proposal status: {}", e)))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
+
+    Ok(Json(CommitProposalResponse {
+        proposal_id: id,
+        memory_item_id: committed.memory_item_id,
+        version_id: committed.version_id,
+        superseded_version_id: committed.superseded_version_id,
+        committed_at,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_memory_item(
+    tx: &Transaction<'_>,
+    memory_type: &str,
+    subject_key: &str,
+    value_json: &Value,
+    evidence_record_ids: &[String],
+    scope: Option<&MemoryScopePayload>,
+    freshness: Option<&str>,
+    confidence: f32,
+    committed_at: &str,
+) -> Result<CommittedMemoryIds, ApiError> {
+    for evidence_id in evidence_record_ids {
+        ensure_evidence_exists(tx, evidence_id)?;
+    }
+
+    let (memory_item_id, old_active_version_id) =
+        ensure_memory_item(tx, memory_type, subject_key, committed_at)?;
+    let version_number = next_version_number(tx, &memory_item_id)?;
     let new_version_id = Uuid::new_v4().to_string();
 
     if let Some(old_version_id) = &old_active_version_id {
@@ -825,7 +1279,7 @@ async fn commit_proposal(
             new_version_id,
             memory_item_id,
             version_number,
-            serde_json::to_string(&payload.value_json)
+            serde_json::to_string(value_json)
                 .map_err(|e| ApiError::internal(format!("failed value_json encode: {}", e)))?,
             old_active_version_id,
             committed_at,
@@ -834,7 +1288,7 @@ async fn commit_proposal(
     )
     .map_err(|e| ApiError::internal(format!("failed to insert memory version: {}", e)))?;
 
-    for evidence_id in &payload.evidence_record_ids {
+    for evidence_id in evidence_record_ids {
         tx.execute(
             "
             INSERT INTO memory_links (
@@ -862,55 +1316,40 @@ async fn commit_proposal(
     .map_err(|e| ApiError::internal(format!("failed to update memory item: {}", e)))?;
 
     upsert_memory_metadata(
-        &tx,
+        tx,
         &memory_item_id,
-        payload.scope.as_ref(),
-        payload.freshness.as_deref(),
-        proposal.confidence,
-        &committed_at,
+        scope,
+        freshness,
+        confidence,
+        committed_at,
     )?;
     upsert_memory_fts_document(
-        &tx,
+        tx,
         &memory_item_id,
-        &proposal.subject_key,
-        &payload.memory_type,
-        &payload.value_json,
-        payload.scope.as_ref(),
+        subject_key,
+        memory_type,
+        value_json,
+        scope,
     )?;
-    let observation_evidence_ids = load_memory_evidence_ids(&tx, &memory_item_id)?;
+    let observation_evidence_ids = load_memory_evidence_ids(tx, &memory_item_id)?;
     upsert_observation_for_memory(
-        &tx,
+        tx,
         &memory_item_id,
-        &proposal.subject_key,
-        &payload.memory_type,
-        &payload.value_json,
+        subject_key,
+        memory_type,
+        value_json,
         &observation_evidence_ids,
-        payload.scope.as_ref(),
-        payload.freshness.as_deref(),
-        proposal.confidence,
-        &committed_at,
+        scope,
+        freshness,
+        confidence,
+        committed_at,
     )?;
 
-    tx.execute(
-        "
-        UPDATE memory_proposals
-        SET status = 'committed', resolved_at = ?2
-        WHERE id = ?1
-        ",
-        params![proposal.id, committed_at],
-    )
-    .map_err(|e| ApiError::internal(format!("failed to update proposal status: {}", e)))?;
-
-    tx.commit()
-        .map_err(|e| ApiError::internal(format!("failed to commit tx: {}", e)))?;
-
-    Ok(Json(CommitProposalResponse {
-        proposal_id: id,
+    Ok(CommittedMemoryIds {
         memory_item_id,
         version_id: new_version_id,
         superseded_version_id: old_active_version_id,
-        committed_at,
-    }))
+    })
 }
 
 fn upsert_memory_metadata(
@@ -1499,6 +1938,12 @@ fn stable_key_fragment(value: &str) -> String {
     } else {
         fragment
     }
+}
+
+fn checksum_hex(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hex::encode(hasher.finalize())
 }
 
 fn statement_from_memory_value(canonical_key: &str, value_json: &Value) -> String {
@@ -3915,7 +4360,8 @@ mod tests {
     use super::{
         apply_graph_confidence_migration, apply_observation_canonical_key_migration,
         compact_graph_relationships, ensure_graph_entity, ensure_graph_entity_without_alias,
-        upsert_observation_for_memory, CreateProposalRequest, GraphEntityRef,
+        import_markdown_content, parse_markdown_memory_items, upsert_observation_for_memory,
+        CreateProposalRequest, GraphEntityRef, ImportMarkdownRequest,
     };
 
     #[test]
@@ -3932,6 +4378,99 @@ mod tests {
         };
 
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn markdown_import_parser_extracts_sectioned_memory_items() {
+        let items = parse_markdown_memory_items(
+            r#"
+# Project Memory
+
+## Decisions
+
+- Use SQLite for local-first storage.
+- Avoid cloud sync in the MVP.
+
+## Preferences
+
+Prefer Rust for CLI tools.
+
+```text
+- ignore fenced code
+```
+"#,
+        );
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].memory_type, "project");
+        assert_eq!(items[2].memory_type, "preference");
+        assert_eq!(items[2].statement, "Prefer Rust for CLI tools.");
+    }
+
+    #[test]
+    fn markdown_import_commits_evidence_memory_and_observation() {
+        let mut conn = test_conn();
+        let imported_at = "2026-04-24T12:00:00+00:00";
+        let request = ImportMarkdownRequest {
+            source_ref: "AGENTS.md".to_string(),
+            content: "# Decisions\n\n- Use SQLite for local-first storage.".to_string(),
+            source_type: None,
+            scope: None,
+            commit: Some(true),
+            confidence: Some(0.81),
+        };
+
+        let tx = conn.transaction().expect("transaction should start");
+        let response =
+            import_markdown_content(&tx, &request, imported_at).expect("import should work");
+        tx.commit().expect("transaction should commit");
+
+        assert_eq!(response.imported_items, 1);
+        assert_eq!(response.committed_items, 1);
+        assert_eq!(response.skipped_items, 0);
+        assert_eq!(response.evidence_record_ids.len(), 1);
+        assert_eq!(response.proposal_ids.len(), 1);
+        assert_eq!(response.memory_item_ids.len(), 1);
+
+        let memory_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_items", [], |row| row.get(0))
+            .expect("memory count should be queryable");
+        assert_eq!(memory_count, 1);
+
+        let observation_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+            .expect("observation count should be queryable");
+        assert_eq!(observation_count, 1);
+
+        let fts_count: i64 = conn
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM retrieval_documents_fts
+                WHERE retrieval_documents_fts MATCH 'sqlite'
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .expect("FTS count should be queryable");
+        assert_eq!(fts_count, 2);
+
+        let tx = conn
+            .transaction()
+            .expect("second import transaction should start");
+        let repeated_response =
+            import_markdown_content(&tx, &request, imported_at).expect("repeat import should work");
+        tx.commit().expect("second transaction should commit");
+        assert_eq!(repeated_response.imported_items, 1);
+        assert_eq!(repeated_response.committed_items, 0);
+        assert_eq!(repeated_response.skipped_items, 1);
+
+        let version_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_item_versions", [], |row| {
+                row.get(0)
+            })
+            .expect("version count should be queryable");
+        assert_eq!(version_count, 1);
     }
 
     #[test]

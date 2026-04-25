@@ -8,19 +8,20 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
-3. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
-4. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence; updates are classified as strengthening, weakening, or contradicted and appended to an observation event log.
-5. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.
-6. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
-7. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
-8. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
-9. Audit: every retrieval and redaction is logged.
+3. Markdown Import: existing developer memory files can be converted into evidence-backed `markdown_import` proposals and committed memories.
+4. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
+5. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence; updates are classified as strengthening, weakening, or contradicted and appended to an observation event log.
+6. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.
+7. Graph Canonicalization: alias rules and compaction collapse duplicate entities/edges into stable canonical graph state.
+8. Retrieval v2: repo/workspace-scoped candidate sources are fused into an answer contract with abstention and optional trace output.
+9. Policy Projection: memory and traces are filtered by scope/sensitivity before exposure via MCP.
+10. Audit: every retrieval and redaction is logged.
 
 ## Modules
 
 - `ingest-service`: ingest and normalize events.
 - `evidence-store`: append-only evidence and provenance metadata.
-- `memory-compiler`: dedupe, supersede, canonicalize.
+- `memory-compiler`: import Markdown memory files, dedupe, supersede, canonicalize.
 - `graph-compiler`: entity/relationship memory with versioned edges, alias rules, and compaction.
 - `policy-engine`: evaluate source/category/agent scope rules.
 - `mcp-gateway`: retrieval and commit APIs.

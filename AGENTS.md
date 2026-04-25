@@ -41,6 +41,9 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - calibrated abstention for missing evidence, out-of-scope, stale, contradicted, and low-confidence cases
   - optional trace output with redaction-safe fields only
 - Extended memory compiler commits for retrieval v2 indexing:
+  - added `POST /v1/import/markdown` to convert existing Markdown memory files (`AGENTS.md`, `CLAUDE.md`, `memory.md`) into evidence-backed `markdown_import` proposals
+  - Markdown imports can commit directly into memory items, observations, observation events, and retrieval FTS without the compiler reading arbitrary filesystem paths
+  - repeated unchanged Markdown imports skip duplicate commits instead of creating noisy memory versions
   - `POST /v1/proposals` accepts optional scope and freshness metadata
   - committed memories upsert `memory_item_metadata`
   - committed memories and graph relationships upsert local `retrieval_documents_fts` documents
