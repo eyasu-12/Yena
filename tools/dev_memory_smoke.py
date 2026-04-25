@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import forget_import_source
 import import_markdown_memory
 import list_audit_events
 import retrieve_memory
@@ -158,10 +159,26 @@ def list_retrieval_audits(gateway_url: str, agent_id: str, timeout: float) -> di
     return list_audit_events.list_events(args)
 
 
+def forget_fixture_source(markdown_path: Path, compiler_url: str, timeout: float) -> dict[str, Any]:
+    args = argparse.Namespace(
+        source=str(markdown_path),
+        compiler_url=compiler_url,
+        source_type="local_markdown_memory",
+        keep_evidence=False,
+        scope="none",
+        literal=False,
+        timeout=timeout,
+        dry_run=False,
+        json=True,
+    )
+    return forget_import_source.forget_source(args)
+
+
 def validate_smoke_outputs(
     import_response: dict[str, Any],
     retrieval_response: dict[str, Any],
     audit_response: dict[str, Any],
+    forget_response: dict[str, Any] | None = None,
 ) -> None:
     if import_response.get("committed_items", 0) < 1:
         raise RuntimeError(f"expected committed import items, got: {import_response}")
@@ -180,6 +197,12 @@ def validate_smoke_outputs(
     if events[0].get("request_type") != "retrieve_v2":
         raise RuntimeError(f"latest audit event was not retrieve_v2: {events[0]}")
 
+    if forget_response is not None:
+        if forget_response.get("deleted_memory_items", 0) < 1:
+            raise RuntimeError(f"expected source forget to delete memories: {forget_response}")
+        if forget_response.get("deleted_evidence", 0) < 1:
+            raise RuntimeError(f"expected source forget to delete evidence: {forget_response}")
+
 
 def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     repo_root = find_repo_root(Path.cwd())
@@ -197,6 +220,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     gateway_url = base_url(args.gateway_bind)
     compiler: subprocess.Popen[str] | None = None
     gateway: subprocess.Popen[str] | None = None
+    forget_response: dict[str, Any] | None = None
 
     try:
         compiler = start_service(
@@ -219,7 +243,23 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         wait_for_health(gateway_url, gateway, args.startup_timeout)
         retrieval_response = retrieve_fixture(gateway_url, args.agent_id, args.timeout)
         audit_response = list_retrieval_audits(gateway_url, args.agent_id, args.timeout)
-        validate_smoke_outputs(import_response, retrieval_response, audit_response)
+        stop_service(gateway)
+        gateway = None
+
+        compiler = start_service(
+            "memory-compiler",
+            db_path=db_path,
+            bind=args.compiler_bind,
+            cwd=repo_root,
+        )
+        wait_for_health(compiler_url, compiler, args.startup_timeout)
+        forget_response = forget_fixture_source(markdown_path, compiler_url, args.timeout)
+        validate_smoke_outputs(
+            import_response,
+            retrieval_response,
+            audit_response,
+            forget_response,
+        )
     finally:
         if compiler is not None:
             stop_service(compiler)
@@ -237,6 +277,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "import": import_response,
         "retrieval": retrieval_response,
         "audit": audit_response,
+        "forget": forget_response,
     }
 
 
@@ -244,6 +285,7 @@ def format_summary(report: dict[str, Any]) -> str:
     import_response = report["import"]
     answer = report["retrieval"]["answer_context"]
     audit = report["audit"]
+    forget = report["forget"]
     first_memory = answer["memories"][0]
     return "\n".join(
         [
@@ -257,6 +299,10 @@ def format_summary(report: dict[str, Any]) -> str:
             "audit: events={count} latest={latest}".format(
                 count=audit.get("returned"),
                 latest=audit.get("events", [{}])[0].get("request_type"),
+            ),
+            "forget: deleted_memories={memories} deleted_evidence={evidence}".format(
+                memories=forget.get("deleted_memory_items"),
+                evidence=forget.get("deleted_evidence"),
             ),
         ]
     )

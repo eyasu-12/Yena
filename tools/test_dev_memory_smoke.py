@@ -65,6 +65,10 @@ class DevMemorySmokeTests(unittest.TestCase):
                     "returned": 1,
                     "events": [{"request_type": "retrieve_v2"}],
                 },
+                "forget": {
+                    "deleted_memory_items": 2,
+                    "deleted_evidence": 2,
+                },
             }
         )
 
@@ -72,6 +76,7 @@ class DevMemorySmokeTests(unittest.TestCase):
         self.assertIn("import: committed=2 skipped=0 job=job-1", summary)
         self.assertIn("retrieval: Use SQLite", summary)
         self.assertIn("audit: events=1 latest=retrieve_v2", summary)
+        self.assertIn("forget: deleted_memories=2 deleted_evidence=2", summary)
 
     def test_run_smoke_rejects_existing_explicit_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

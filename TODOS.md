@@ -28,6 +28,12 @@
 
 **What it does:** Reads explicit local Markdown files, attaches git repo scope when available, and sends content to the compiler import endpoint. It supports committed imports, pending proposal imports, dry-run summaries, configurable compiler URL, source type, confidence, and JSON output.
 
+### Local Imported Source Forget CLI
+
+**Completed:** `tools/forget_import_source.py`.
+
+**What it does:** Calls `POST /v1/import/sources/forget` from the terminal, resolving existing file paths with the same source-ref convention as the import CLI. It supports source type filters, all-source-type forget, keep-evidence mode, dry-run requests, and JSON output.
+
 ### Local Retrieval V2 CLI
 
 **Completed:** `tools/retrieve_memory.py`.
@@ -44,4 +50,4 @@
 
 **Completed:** `tools/dev_memory_smoke.py`.
 
-**What it does:** Runs the local import -> retrieval v2 -> audit visibility loop against a fresh temporary DB. It starts `memory-compiler`, imports a Markdown fixture, starts `mcp-gateway` on the same DB, verifies retrieval returns the expected SQLite memory, and verifies a `retrieve_v2` audit event is visible.
+**What it does:** Runs the local import -> retrieval v2 -> audit visibility -> source forget loop against a fresh temporary DB. It starts `memory-compiler`, imports a Markdown fixture, starts `mcp-gateway` on the same DB, verifies retrieval returns the expected SQLite memory, verifies a `retrieve_v2` audit event is visible, then revokes the imported source and verifies deletion counts.

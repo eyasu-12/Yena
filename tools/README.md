@@ -41,6 +41,32 @@ Useful options:
 - `--scope none`: import without repo scope.
 - `--json`: print full JSON responses.
 
+## Imported Source Forget
+
+`forget_import_source.py` revokes memories imported from a source such as `AGENTS.md` or `CLAUDE.md`.
+
+Forget an imported file:
+
+```bash
+python3 tools/forget_import_source.py AGENTS.md
+```
+
+Preview the request:
+
+```bash
+python3 tools/forget_import_source.py AGENTS.md --dry-run
+```
+
+Useful options:
+
+- `--compiler-url http://127.0.0.1:8081`: memory compiler base URL.
+- `--source-type local_markdown_memory`: source type filter.
+- `--all-source-types`: match the source across all import source types.
+- `--keep-evidence`: delete imported memories/proposals but keep evidence records when possible.
+- `--scope repo`: resolve existing paths the same way as `import_markdown_memory.py`.
+- `--literal`: use the source exactly as provided.
+- `--json`: print the full JSON response.
+
 ## Retrieval V2 Query
 
 `retrieve_memory.py` queries imported and compiled memory through the `mcp-gateway` `/v2/retrieve` endpoint.
@@ -120,6 +146,7 @@ Useful options:
 3. Starts `mcp-gateway` against the same DB.
 4. Queries retrieval v2.
 5. Lists the resulting audit event.
+6. Forgets the imported source.
 
 Run it:
 
