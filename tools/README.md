@@ -79,3 +79,34 @@ Useful options:
 - `--limit 8`: maximum memories returned.
 - `--include-trace`: request redaction-safe trace fields.
 - `--json`: print the full JSON response.
+
+## Audit Event Listing
+
+`list_audit_events.py` lists recent retrieval audit events from `mcp-gateway`.
+
+List recent events:
+
+```bash
+python3 tools/list_audit_events.py
+```
+
+Filter to the local retrieval CLI:
+
+```bash
+python3 tools/list_audit_events.py --agent-id yena-cli --request-type retrieve_v2
+```
+
+Print full JSON:
+
+```bash
+python3 tools/list_audit_events.py --json
+```
+
+Useful options:
+
+- `--gateway-url http://127.0.0.1:8082`: MCP gateway base URL.
+- `--limit 20`: maximum events returned.
+- `--agent-id yena-cli`: filter by agent id.
+- `--request-type retrieve_v2`: filter by retrieval type.
+- `--dry-run`: print the request without sending it.
+- `--json`: print the full JSON response.

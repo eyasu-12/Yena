@@ -54,7 +54,13 @@ python3 tools/import_markdown_memory.py AGENTS.md
 python3 tools/retrieve_memory.py "What database did we choose for this repo?"
 ```
 
-5. Exercise MCP JSON-RPC endpoint:
+5. Inspect retrieval audit events:
+
+```bash
+python3 tools/list_audit_events.py --agent-id yena-cli --request-type retrieve_v2
+```
+
+6. Exercise MCP JSON-RPC endpoint:
 
 ```bash
 curl -X POST http://127.0.0.1:8082/mcp \

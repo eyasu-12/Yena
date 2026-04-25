@@ -33,3 +33,9 @@
 **Completed:** `tools/retrieve_memory.py`.
 
 **What it does:** Sends governed questions to `mcp-gateway` `/v2/retrieve`, defaults to repo-scoped retrieval when inside a git repo, writes a stable CLI `agent_id` for audit logs, and supports dry-run requests, custom scopes, trace requests, JSON output, and concise human-readable answers.
+
+### Local Audit Events CLI
+
+**Completed:** `tools/list_audit_events.py`.
+
+**What it does:** Lists recent retrieval audit events from `mcp-gateway`, supports filtering by agent id and request type, and prints either concise privacy summaries or full JSON. This makes the verifiable-privacy loop visible from the terminal before a dashboard exists.
