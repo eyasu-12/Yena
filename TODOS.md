@@ -39,3 +39,9 @@
 **Completed:** `tools/list_audit_events.py`.
 
 **What it does:** Lists recent retrieval audit events from `mcp-gateway`, supports filtering by agent id and request type, and prints either concise privacy summaries or full JSON. This makes the verifiable-privacy loop visible from the terminal before a dashboard exists.
+
+### End-to-End Developer Memory Smoke
+
+**Completed:** `tools/dev_memory_smoke.py`.
+
+**What it does:** Runs the local import -> retrieval v2 -> audit visibility loop against a fresh temporary DB. It starts `memory-compiler`, imports a Markdown fixture, starts `mcp-gateway` on the same DB, verifies retrieval returns the expected SQLite memory, and verifies a `retrieve_v2` audit event is visible.

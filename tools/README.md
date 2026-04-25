@@ -110,3 +110,32 @@ Useful options:
 - `--request-type retrieve_v2`: filter by retrieval type.
 - `--dry-run`: print the request without sending it.
 - `--json`: print the full JSON response.
+
+## End-to-End Developer Memory Smoke
+
+`dev_memory_smoke.py` verifies the local developer-memory loop against a fresh temporary SQLite DB:
+
+1. Starts `memory-compiler`.
+2. Imports a temporary Markdown memory fixture.
+3. Starts `mcp-gateway` against the same DB.
+4. Queries retrieval v2.
+5. Lists the resulting audit event.
+
+Run it:
+
+```bash
+python3 tools/dev_memory_smoke.py
+```
+
+Print the full report:
+
+```bash
+python3 tools/dev_memory_smoke.py --json
+```
+
+Useful options:
+
+- `--compiler-bind 127.0.0.1:18081`: compiler bind address.
+- `--gateway-bind 127.0.0.1:18082`: gateway bind address.
+- `--agent-id yena-smoke`: agent id used for retrieval and audit.
+- `--keep-files`: keep the generated DB and Markdown fixture for inspection.
