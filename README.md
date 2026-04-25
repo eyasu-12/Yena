@@ -14,6 +14,7 @@ Yena is a local-first memory control plane for agentic systems.
 - MCP gateway API contract: `docs/MCP_GATEWAY_API.md`
 - External memory research notes: `docs/PERSISTENT_MEMORY_RESEARCH.md`
 - DB schema migrations: `db/migrations/`
+- Local developer tools: `tools/`
 
 ## Phase 0 Status
 
@@ -40,7 +41,14 @@ cargo run -p memory-compiler
 cargo run -p mcp-gateway
 ```
 
-3. Exercise MCP JSON-RPC endpoint:
+3. Import an existing Markdown memory file:
+
+```bash
+python3 tools/import_markdown_memory.py AGENTS.md --dry-run
+python3 tools/import_markdown_memory.py AGENTS.md
+```
+
+4. Exercise MCP JSON-RPC endpoint:
 
 ```bash
 curl -X POST http://127.0.0.1:8082/mcp \
