@@ -8,7 +8,7 @@ Provide cross-agent persistent memory with explicit governance, provenance, and 
 
 1. Ingestion: agent activities and portability jobs enter Yena.
 2. Evidence Store: every input becomes immutable evidence.
-3. Markdown Import: existing developer memory files can be converted into evidence-backed `markdown_import` proposals and committed memories.
+3. Markdown Import: existing developer memory files can be converted into evidence-backed `markdown_import` proposals and committed memories, with durable import job reports.
 4. Memory Compiler: evidence is transformed into canonical memory items through proposal + conflict resolution.
 5. Observation Compiler: committed memory is projected into canonical durable observations linked to memory and merged evidence; updates are classified as strengthening, weakening, or contradicted and appended to an observation event log.
 6. Retrieval Indexing: committed memory, observations, and graph relationships are projected into a local SQLite FTS index.

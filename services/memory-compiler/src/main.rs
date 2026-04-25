@@ -122,6 +122,7 @@ struct ImportMarkdownRequest {
 
 #[derive(Debug, Serialize)]
 struct ImportMarkdownResponse {
+    job_id: String,
     source_ref: String,
     imported_items: usize,
     committed_items: usize,
@@ -130,6 +131,47 @@ struct ImportMarkdownResponse {
     proposal_ids: Vec<String>,
     memory_item_ids: Vec<String>,
 }
+
+#[derive(Debug, Serialize)]
+struct ImportJobResponse {
+    job_id: String,
+    source_type: String,
+    source_ref: String,
+    status: String,
+    commit_requested: bool,
+    imported_items: i64,
+    committed_items: i64,
+    skipped_items: i64,
+    created_at: String,
+    completed_at: Option<String>,
+    items: Vec<ImportJobItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportJobItemResponse {
+    item_id: String,
+    source_ref: String,
+    section_path: String,
+    statement: String,
+    memory_type: String,
+    status: String,
+    evidence_record_id: String,
+    proposal_id: Option<String>,
+    memory_item_id: Option<String>,
+    created_at: String,
+}
+
+type ImportJobRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<String>,
+);
 
 #[derive(Debug, Clone)]
 struct ParsedMarkdownMemory {
@@ -698,6 +740,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/import/markdown", post(import_markdown))
+        .route("/v1/import/jobs/{id}", get(get_import_job))
         .route("/v1/proposals", post(create_proposal))
         .route("/v1/proposals/{id}/commit", post(commit_proposal))
         .route("/v1/proposals/{id}/reject", post(reject_proposal))
@@ -768,6 +811,14 @@ async fn import_markdown(
         .map_err(|e| ApiError::internal(format!("failed to commit markdown import: {}", e)))?;
 
     Ok(Json(response))
+}
+
+async fn get_import_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ImportJobResponse>, ApiError> {
+    let conn = open_db(&state.db_path)?;
+    Ok(Json(load_import_job(&conn, &id)?))
 }
 
 async fn create_proposal(
@@ -862,11 +913,21 @@ fn import_markdown_content(
         .unwrap_or("local_markdown_memory");
     let should_commit = payload.commit.unwrap_or(true);
     let confidence = payload.confidence.unwrap_or(0.74);
+    let job_id = Uuid::new_v4().to_string();
     let mut evidence_record_ids = Vec::new();
     let mut proposal_ids = Vec::new();
     let mut memory_item_ids = Vec::new();
     let mut skipped_items = 0usize;
     let source_slug = stable_key_fragment(&payload.source_ref);
+
+    insert_import_job(
+        tx,
+        &job_id,
+        source_type,
+        &payload.source_ref,
+        should_commit,
+        imported_at,
+    )?;
 
     for item in parsed_items {
         let item_checksum = checksum_hex(item.statement.as_bytes());
@@ -899,10 +960,23 @@ fn import_markdown_content(
         let evidence_ids = vec![evidence_id.clone()];
         evidence_record_ids.push(evidence_id.clone());
 
-        if should_commit
-            && active_memory_matches_import(tx, &subject_key, &value_json, &evidence_ids)?
+        if let Some(existing_memory_id) = should_commit
+            .then(|| matching_active_import_memory_id(tx, &subject_key, &value_json, &evidence_ids))
+            .transpose()?
+            .flatten()
         {
             skipped_items += 1;
+            insert_import_job_item(
+                tx,
+                &job_id,
+                &payload.source_ref,
+                &item,
+                "skipped",
+                &evidence_id,
+                None,
+                Some(&existing_memory_id),
+                imported_at,
+            )?;
             continue;
         }
 
@@ -929,12 +1003,45 @@ fn import_markdown_content(
                 confidence,
                 imported_at,
             )?;
+            insert_import_job_item(
+                tx,
+                &job_id,
+                &payload.source_ref,
+                &item,
+                "committed",
+                &evidence_id,
+                Some(&proposal_id),
+                Some(&committed.memory_item_id),
+                imported_at,
+            )?;
             memory_item_ids.push(committed.memory_item_id);
+        } else {
+            insert_import_job_item(
+                tx,
+                &job_id,
+                &payload.source_ref,
+                &item,
+                "pending",
+                &evidence_id,
+                Some(&proposal_id),
+                None,
+                imported_at,
+            )?;
         }
         proposal_ids.push(proposal_id);
     }
 
+    complete_import_job(
+        tx,
+        &job_id,
+        evidence_record_ids.len(),
+        memory_item_ids.len(),
+        skipped_items,
+        imported_at,
+    )?;
+
     Ok(ImportMarkdownResponse {
+        job_id,
         source_ref: payload.source_ref.clone(),
         imported_items: evidence_record_ids.len(),
         committed_items: memory_item_ids.len(),
@@ -1038,16 +1145,110 @@ fn upsert_import_evidence(
     Ok(evidence_id)
 }
 
-fn active_memory_matches_import(
+fn insert_import_job(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    source_type: &str,
+    source_ref: &str,
+    commit_requested: bool,
+    created_at: &str,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "
+        INSERT INTO import_jobs (
+          id, source_type, source_ref, status, commit_requested, imported_items,
+          committed_items, skipped_items, created_at, completed_at
+        ) VALUES (?1, ?2, ?3, 'running', ?4, 0, 0, 0, ?5, NULL)
+        ",
+        params![
+            job_id,
+            source_type,
+            source_ref,
+            if commit_requested { 1 } else { 0 },
+            created_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert import job: {}", e)))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_import_job_item(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    source_ref: &str,
+    item: &ParsedMarkdownMemory,
+    status: &str,
+    evidence_record_id: &str,
+    proposal_id: Option<&str>,
+    memory_item_id: Option<&str>,
+    created_at: &str,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "
+        INSERT INTO import_job_items (
+          id, import_job_id, source_ref, section_path, statement, memory_type,
+          status, evidence_record_id, proposal_id, memory_item_id, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ",
+        params![
+            Uuid::new_v4().to_string(),
+            job_id,
+            source_ref,
+            &item.section_path,
+            &item.statement,
+            &item.memory_type,
+            status,
+            evidence_record_id,
+            proposal_id,
+            memory_item_id,
+            created_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to insert import job item: {}", e)))?;
+    Ok(())
+}
+
+fn complete_import_job(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    imported_items: usize,
+    committed_items: usize,
+    skipped_items: usize,
+    completed_at: &str,
+) -> Result<(), ApiError> {
+    tx.execute(
+        "
+        UPDATE import_jobs
+        SET status = 'completed',
+            imported_items = ?2,
+            committed_items = ?3,
+            skipped_items = ?4,
+            completed_at = ?5
+        WHERE id = ?1
+        ",
+        params![
+            job_id,
+            imported_items as i64,
+            committed_items as i64,
+            skipped_items as i64,
+            completed_at,
+        ],
+    )
+    .map_err(|e| ApiError::internal(format!("failed to complete import job: {}", e)))?;
+    Ok(())
+}
+
+fn matching_active_import_memory_id(
     tx: &Transaction<'_>,
     subject_key: &str,
     value_json: &Value,
     evidence_record_ids: &[String],
-) -> Result<bool, ApiError> {
-    let row: Option<(String, String)> = tx
+) -> Result<Option<String>, ApiError> {
+    let row: Option<(String, String, String)> = tx
         .query_row(
             "
-            SELECT mi.active_version_id, mv.value_json
+            SELECT mi.id, mi.active_version_id, mv.value_json
             FROM memory_items mi
             JOIN memory_item_versions mv ON mv.id = mi.active_version_id
             WHERE mi.canonical_key = ?1
@@ -1055,26 +1256,120 @@ fn active_memory_matches_import(
             LIMIT 1
             ",
             params![subject_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|e| ApiError::internal(format!("failed to lookup imported memory: {}", e)))?;
 
-    let Some((active_version_id, active_value_raw)) = row else {
-        return Ok(false);
+    let Some((memory_item_id, active_version_id, active_value_raw)) = row else {
+        return Ok(None);
     };
     let active_value: Value = serde_json::from_str(&active_value_raw).map_err(|e| {
         ApiError::internal(format!("failed to decode imported active value: {}", e))
     })?;
     if active_value != *value_json {
-        return Ok(false);
+        return Ok(None);
     }
 
     let active_evidence = load_evidence_for_version(tx, &active_version_id)?
         .into_iter()
         .collect::<BTreeSet<_>>();
     let requested_evidence = evidence_record_ids.iter().cloned().collect::<BTreeSet<_>>();
-    Ok(active_evidence == requested_evidence)
+    if active_evidence == requested_evidence {
+        Ok(Some(memory_item_id))
+    } else {
+        Ok(None)
+    }
+}
+
+fn load_import_job(conn: &Connection, job_id: &str) -> Result<ImportJobResponse, ApiError> {
+    let job: Option<ImportJobRow> = conn
+        .query_row(
+            "
+            SELECT source_type, source_ref, status, commit_requested, imported_items,
+              committed_items, skipped_items, created_at, completed_at
+            FROM import_jobs
+            WHERE id = ?1
+            LIMIT 1
+            ",
+            params![job_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ApiError::internal(format!("failed to lookup import job: {}", e)))?;
+    let (
+        source_type,
+        source_ref,
+        status,
+        commit_requested,
+        imported_items,
+        committed_items,
+        skipped_items,
+        created_at,
+        completed_at,
+    ) = job.ok_or_else(|| ApiError::not_found("import job not found"))?;
+
+    Ok(ImportJobResponse {
+        job_id: job_id.to_string(),
+        source_type,
+        source_ref,
+        status,
+        commit_requested: commit_requested != 0,
+        imported_items,
+        committed_items,
+        skipped_items,
+        created_at,
+        completed_at,
+        items: load_import_job_items(conn, job_id)?,
+    })
+}
+
+fn load_import_job_items(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<ImportJobItemResponse>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, source_ref, section_path, statement, memory_type, status,
+              evidence_record_id, proposal_id, memory_item_id, created_at
+            FROM import_job_items
+            WHERE import_job_id = ?1
+            ORDER BY created_at ASC, id ASC
+            ",
+        )
+        .map_err(|e| ApiError::internal(format!("failed to prepare import items: {}", e)))?;
+    let rows = stmt
+        .query_map(params![job_id], |row| {
+            Ok(ImportJobItemResponse {
+                item_id: row.get(0)?,
+                source_ref: row.get(1)?,
+                section_path: row.get(2)?,
+                statement: row.get(3)?,
+                memory_type: row.get(4)?,
+                status: row.get(5)?,
+                evidence_record_id: row.get(6)?,
+                proposal_id: row.get(7)?,
+                memory_item_id: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })
+        .map_err(|e| ApiError::internal(format!("failed to query import job items: {}", e)))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ApiError::internal(format!("failed to read import job items: {}", e)))
 }
 
 fn parse_markdown_memory_items(content: &str) -> Vec<ParsedMarkdownMemory> {
@@ -4305,6 +4600,7 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0008_observation_events.sql"
     ))?;
+    conn.execute_batch(include_str!("../../../db/migrations/0009_import_jobs.sql"))?;
     Ok(())
 }
 
@@ -4360,8 +4656,9 @@ mod tests {
     use super::{
         apply_graph_confidence_migration, apply_observation_canonical_key_migration,
         compact_graph_relationships, ensure_graph_entity, ensure_graph_entity_without_alias,
-        import_markdown_content, parse_markdown_memory_items, upsert_observation_for_memory,
-        CreateProposalRequest, GraphEntityRef, ImportMarkdownRequest,
+        import_markdown_content, load_import_job, parse_markdown_memory_items,
+        upsert_observation_for_memory, CreateProposalRequest, GraphEntityRef,
+        ImportMarkdownRequest,
     };
 
     #[test]
@@ -4428,6 +4725,7 @@ Prefer Rust for CLI tools.
         assert_eq!(response.imported_items, 1);
         assert_eq!(response.committed_items, 1);
         assert_eq!(response.skipped_items, 0);
+        assert!(!response.job_id.is_empty());
         assert_eq!(response.evidence_record_ids.len(), 1);
         assert_eq!(response.proposal_ids.len(), 1);
         assert_eq!(response.memory_item_ids.len(), 1);
@@ -4455,6 +4753,13 @@ Prefer Rust for CLI tools.
             .expect("FTS count should be queryable");
         assert_eq!(fts_count, 2);
 
+        let import_job = load_import_job(&conn, &response.job_id).expect("job should load");
+        assert_eq!(import_job.imported_items, 1);
+        assert_eq!(import_job.committed_items, 1);
+        assert_eq!(import_job.skipped_items, 0);
+        assert_eq!(import_job.items.len(), 1);
+        assert_eq!(import_job.items[0].status, "committed");
+
         let tx = conn
             .transaction()
             .expect("second import transaction should start");
@@ -4464,6 +4769,11 @@ Prefer Rust for CLI tools.
         assert_eq!(repeated_response.imported_items, 1);
         assert_eq!(repeated_response.committed_items, 0);
         assert_eq!(repeated_response.skipped_items, 1);
+        let repeated_job =
+            load_import_job(&conn, &repeated_response.job_id).expect("repeat job should load");
+        assert_eq!(repeated_job.items.len(), 1);
+        assert_eq!(repeated_job.items[0].status, "skipped");
+        assert!(repeated_job.items[0].memory_item_id.is_some());
 
         let version_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM memory_item_versions", [], |row| {
@@ -4858,6 +5168,8 @@ Prefer Rust for CLI tools.
             "../../../db/migrations/0008_observation_events.sql"
         ))
         .expect("observation event migration should apply");
+        conn.execute_batch(include_str!("../../../db/migrations/0009_import_jobs.sql"))
+            .expect("import job migration should apply");
         conn
     }
 

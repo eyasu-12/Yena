@@ -20,4 +20,4 @@
 
 **Completed:** `POST /v1/import/markdown` in `memory-compiler`.
 
-**What it does:** Parses Markdown content passed by the caller, creates one immutable evidence record per imported item, creates `markdown_import` proposals, optionally commits them directly into memory items, compiled observations, observation events, and retrieval FTS. Repeated unchanged imports skip duplicate commits.
+**What it does:** Parses Markdown content passed by the caller, creates one immutable evidence record per imported item, creates `markdown_import` proposals, optionally commits them directly into memory items, compiled observations, observation events, and retrieval FTS. Repeated unchanged imports skip duplicate commits. Each import persists a durable job report queryable through `GET /v1/import/jobs/{id}`.

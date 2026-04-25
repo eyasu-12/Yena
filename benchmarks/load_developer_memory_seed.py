@@ -94,6 +94,7 @@ def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path) -> None:
         "0006_retrieval_v2_foundation.sql",
         "0007_observation_canonical_keys.sql",
         "0008_observation_events.sql",
+        "0009_import_jobs.sql",
     ]
     for migration in ordered:
         if migration == "0004_graph_confidence.sql":

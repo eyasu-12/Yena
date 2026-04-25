@@ -1770,6 +1770,7 @@ fn init_db(db_path: &str) -> anyhow::Result<()> {
     conn.execute_batch(include_str!(
         "../../../db/migrations/0008_observation_events.sql"
     ))?;
+    conn.execute_batch(include_str!("../../../db/migrations/0009_import_jobs.sql"))?;
     Ok(())
 }
 

@@ -45,11 +45,13 @@ Behavior:
 - If `commit` is `false`, leaves proposals pending for later review.
 - Uses deterministic subject keys derived from source, section, and item checksum so repeated imports map to the same canonical memory identity.
 - Skips unchanged already-committed items instead of creating duplicate memory versions.
+- Persists an `import_jobs` report with one `import_job_items` row per parsed item.
 
 Response `200`:
 
 ```json
 {
+  "job_id": "uuid",
   "source_ref": "AGENTS.md",
   "imported_items": 2,
   "committed_items": 2,
@@ -57,6 +59,41 @@ Response `200`:
   "evidence_record_ids": ["uuid"],
   "proposal_ids": ["uuid"],
   "memory_item_ids": ["uuid"]
+}
+```
+
+## GET /v1/import/jobs/{id}
+
+Returns the durable report for a Markdown import.
+
+Response `200`:
+
+```json
+{
+  "job_id": "uuid",
+  "source_type": "local_markdown_memory",
+  "source_ref": "AGENTS.md",
+  "status": "completed",
+  "commit_requested": true,
+  "imported_items": 2,
+  "committed_items": 1,
+  "skipped_items": 1,
+  "created_at": "2026-04-24T12:00:00+00:00",
+  "completed_at": "2026-04-24T12:00:00+00:00",
+  "items": [
+    {
+      "item_id": "uuid",
+      "source_ref": "AGENTS.md",
+      "section_path": "Decisions",
+      "statement": "Use SQLite for local-first storage.",
+      "memory_type": "project",
+      "status": "committed",
+      "evidence_record_id": "uuid",
+      "proposal_id": "uuid",
+      "memory_item_id": "uuid",
+      "created_at": "2026-04-24T12:00:00+00:00"
+    }
+  ]
 }
 ```
 
