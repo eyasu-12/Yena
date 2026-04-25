@@ -49,6 +49,7 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
   - added `POST /v1/import/sources/forget` to revoke all committed memories and pending proposals imported from a specific source such as `AGENTS.md` or `CLAUDE.md`
   - verified import source revocation clears imported memories, import proposals, evidence, import job item refs, observations, and retrieval FTS while preserving import job headers
   - added `tools/import_markdown_memory.py` as the first local caller workflow for importing explicit Markdown memory files into the compiler with repo scope, pending/committed modes, dry-run summaries, and JSON output
+  - added `tools/retrieve_memory.py` as the first local retrieval workflow for querying `/v2/retrieve` with repo/global/custom scope, audit-friendly agent id, trace support, JSON output, and concise terminal answers
   - `POST /v1/proposals` accepts optional scope and freshness metadata
   - committed memories upsert `memory_item_metadata`
   - committed memories and graph relationships upsert local `retrieval_documents_fts` documents

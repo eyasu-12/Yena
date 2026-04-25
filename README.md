@@ -48,7 +48,13 @@ python3 tools/import_markdown_memory.py AGENTS.md --dry-run
 python3 tools/import_markdown_memory.py AGENTS.md
 ```
 
-4. Exercise MCP JSON-RPC endpoint:
+4. Ask Yena about imported memory:
+
+```bash
+python3 tools/retrieve_memory.py "What database did we choose for this repo?"
+```
+
+5. Exercise MCP JSON-RPC endpoint:
 
 ```bash
 curl -X POST http://127.0.0.1:8082/mcp \

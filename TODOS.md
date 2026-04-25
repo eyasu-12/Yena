@@ -27,3 +27,9 @@
 **Completed:** `tools/import_markdown_memory.py`.
 
 **What it does:** Reads explicit local Markdown files, attaches git repo scope when available, and sends content to the compiler import endpoint. It supports committed imports, pending proposal imports, dry-run summaries, configurable compiler URL, source type, confidence, and JSON output.
+
+### Local Retrieval V2 CLI
+
+**Completed:** `tools/retrieve_memory.py`.
+
+**What it does:** Sends governed questions to `mcp-gateway` `/v2/retrieve`, defaults to repo-scoped retrieval when inside a git repo, writes a stable CLI `agent_id` for audit logs, and supports dry-run requests, custom scopes, trace requests, JSON output, and concise human-readable answers.
