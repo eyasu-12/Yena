@@ -16,6 +16,12 @@
 
 ## Completed
 
+### CI Checks
+
+**Completed:** `.github/workflows/ci.yml`.
+
+**What it does:** Runs Rust formatting, Rust tests, clippy with warnings denied, Python tool compilation, and Python tool unit tests on pushes to `main`, pull requests, and manual workflow dispatch.
+
 ### Backend Markdown Import Foundation
 
 **Completed:** `POST /v1/import/markdown` in `memory-compiler`.

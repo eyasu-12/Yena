@@ -23,14 +23,22 @@ Yena is a local-first memory control plane for agentic systems.
 - [x] Baseline architecture and threat model docs
 - [x] Initial SQLite schema migration
 - [x] Runtime scaffolding (Rust workspace)
-- [ ] CI and tests
+- [x] CI and tests
 
 ## Next Commands
 
-1. Run tests:
+1. Run local checks:
 
 ```bash
+cargo fmt --check
 cargo test
+cargo clippy --all-targets -- -D warnings
+PYTHONPYCACHEPREFIX=/tmp/yena_pycache python3 -m unittest \
+  tools/test_import_markdown_memory.py \
+  tools/test_forget_import_source.py \
+  tools/test_retrieve_memory.py \
+  tools/test_list_audit_events.py \
+  tools/test_dev_memory_smoke.py
 ```
 
 2. Run services (three terminals):

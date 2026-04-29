@@ -15,6 +15,15 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 
 ## Decision Log
 
+### 2026-04-28
+- Added CI workflow:
+  - `.github/workflows/ci.yml`
+  - runs `cargo fmt --check`
+  - runs `cargo test`
+  - runs `cargo clippy --all-targets -- -D warnings`
+  - compiles Python tools
+  - runs Python tool unit tests
+
 ### 2026-04-24
 
 - Implemented retrieval v2 vertical slice foundation:
