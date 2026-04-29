@@ -22,6 +22,12 @@
 
 **What it does:** Runs Rust formatting, Rust tests, clippy with warnings denied, Python tool compilation, and Python tool unit tests on pushes to `main`, pull requests, and manual workflow dispatch.
 
+### Developer Quickstart
+
+**Completed:** `docs/DEVELOPER_QUICKSTART.md`.
+
+**What it does:** Documents the current local developer path: verify checks, run the end-to-end smoke, start services manually, import Markdown memory, retrieve governed memory, inspect audit events, and forget an imported source.
+
 ### Backend Markdown Import Foundation
 
 **Completed:** `POST /v1/import/markdown` in `memory-compiler`.

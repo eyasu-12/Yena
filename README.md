@@ -8,6 +8,7 @@ Yena is a local-first memory control plane for agentic systems.
 - Build roadmap: `PROJECT_PLAN.md`
 - Work log and decisions: `AGENTS.md`
 - Architecture details: `docs/ARCHITECTURE.md`
+- Developer quickstart: `docs/DEVELOPER_QUICKSTART.md`
 - Security assumptions: `docs/THREAT_MODEL.md`
 - Ingest API contract: `docs/INGEST_API.md`
 - Memory compiler API contract: `docs/MEMORY_COMPILER_API.md`
@@ -26,6 +27,8 @@ Yena is a local-first memory control plane for agentic systems.
 - [x] CI and tests
 
 ## Next Commands
+
+For the full local workflow, follow `docs/DEVELOPER_QUICKSTART.md`.
 
 1. Run local checks:
 

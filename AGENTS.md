@@ -16,6 +16,9 @@ Yena is a local-first memory control plane with immutable evidence, compiled mem
 ## Decision Log
 
 ### 2026-04-28
+- Added developer quickstart:
+  - `docs/DEVELOPER_QUICKSTART.md`
+  - documents local checks, smoke workflow, manual services, Markdown import, retrieval, audit listing, and source forget
 - Added CI workflow:
   - `.github/workflows/ci.yml`
   - runs `cargo fmt --check`
